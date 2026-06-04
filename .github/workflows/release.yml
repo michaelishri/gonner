@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  pull_request_target:
+    types:
+      - closed
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out merged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Task
+        run: go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Determine release bump
+        id: bump
+        shell: bash
+        run: |
+          labels='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          bump=patch
+
+          if echo "$labels" | grep -q '"release:major"'; then
+            bump=major
+          elif echo "$labels" | grep -q '"release:minor"'; then
+            bump=minor
+          fi
+
+          echo "level=$bump" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next tag
+        id: version
+        shell: bash
+        run: |
+          latest="$(git tag --list 'v*' --sort=-version:refname | head -n 1)"
+
+          if [ -z "$latest" ]; then
+            case "${{ steps.bump.outputs.level }}" in
+              major) next="v1.0.0" ;;
+              minor) next="v0.1.0" ;;
+              *) next="v0.0.1" ;;
+            esac
+          else
+            current="${latest#v}"
+            IFS='.' read -r major minor patch <<< "$current"
+
+            case "${{ steps.bump.outputs.level }}" in
+              major)
+                major=$((major + 1))
+                minor=0
+                patch=0
+                ;;
+              minor)
+                minor=$((minor + 1))
+                patch=0
+                ;;
+              *)
+                patch=$((patch + 1))
+                ;;
+            esac
+
+            next="v${major}.${minor}.${patch}"
+          fi
+
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Create local release tag
+        run: git tag "${{ steps.version.outputs.tag }}" "${{ github.event.pull_request.merge_commit_sha }}"
+
+      - name: Run tests
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          task test
+
+      - name: Build release artifacts
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          task release
+          (cd bin && shasum -a 256 gonner-* > checksums.txt)
+
+      - name: Push release tag
+        run: git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            bin/* \
+            --target "${{ github.event.pull_request.merge_commit_sha }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
