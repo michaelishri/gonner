@@ -1,0 +1,59 @@
+{
+    "mode": "parallel",
+    "shutdownTimeout": "30s",
+    "health": {
+        "port": 8089,
+        "bindAddr": "127.0.0.1",
+        "authToken": "{{env://GONNER_HEALTH_TOKEN:}}",
+        "metrics": true
+    },
+    "run": [
+        {
+            "name": "NGINX",
+            "command": "nginx -g 'daemon off;'",
+            "critical": true,
+            "stopSignal": "SIGQUIT",
+            "stopTimeout": "20s",
+            "user": "www-data",
+            "logFile": "/var/log/gonner-nginx.log",
+            "logRotate": { "maxSizeMB": 100, "maxBackups": 5, "compress": true },
+            "whenAll": [
+                { "env": "LARAVEL_WEBSERVER=TRUE" }
+            ],
+            "commandsBefore": [
+                {
+                    "workDir": "/app",
+                    "command": "php artisan migrate --force"
+                }
+            ]
+        },
+        {
+            "name": "Laravel Scheduler",
+            "workDir": "/app",
+            "command": "php artisan schedule:work",
+            "autoRestart": true,
+            "user": "www-data",
+            "logFile": "/var/log/gonner-scheduler.log",
+            "whenAll": [
+                { "env": "LARAVEL_SCHEDULER=TRUE" }
+            ]
+        },
+        {
+            "name": "Laravel Queue Worker",
+            "workDir": "/app",
+            "command": "php artisan queue:work",
+            "autoRestart": true,
+            "instances": 8,
+            "user": "www-data",
+            "dependsOn": ["NGINX"],
+            "logFile": "/var/log/gonner-queues.log",
+            "whenAll": [
+                { "env": "LARAVEL_QUEUE_WORKER=TRUE" },
+                { "portOpen": "redis:6379@3s" }
+            ],
+            "env": {
+                "QUEUE_CONNECTION": "redis"
+            }
+        }
+    ]
+}

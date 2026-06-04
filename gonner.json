@@ -1,0 +1,37 @@
+{
+    "mode": "parallel",
+    "shutdownTimeout": "30s",
+    "health": {
+        "port": 8089,
+        "bindAddr": "127.0.0.1",
+        "metrics": true
+    },
+    "run": [
+        {
+            "name": "Laravel Scheduler",
+            "command": "php artisan schedule:work",
+            "autoRestart": true,
+            "maxRetries": 10,
+            "stopSignal": "SIGTERM",
+            "stopTimeout": "10s",
+            "backoff": {
+                "initialDelay": "2s",
+                "maxDelay": "60s",
+                "multiplier": 2.0
+            },
+            "logFile": "./gonner-scheduler.log",
+            "logRotate": {
+                "maxSizeMB": 50,
+                "maxBackups": 5,
+                "compress": true
+            }
+        },
+        {
+            "name": "Laravel Queue Worker",
+            "command": "php artisan queue:work",
+            "autoRestart": true,
+            "instances": 1,
+            "logFile": "./gonner-queues.log"
+        }
+    ]
+}
