@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,12 +34,14 @@ func TestWriter_Rotation(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "rotate.log")
 
-	w, err := NewWriterWithOptions(Options{
-		ProcessName: "p",
-		LogFilePath: logPath,
-		Rotate:      &RotateOptions{MaxSizeMB: 1, MaxBackups: 2},
-	})
-	if err != nil {
+	w := &Writer{
+		processName: "p",
+		stdout:      io.Discard,
+		logFilePath: logPath,
+		logFileMode: 0o600,
+		rotate:      &RotateOptions{MaxSizeMB: 1, MaxBackups: 2},
+	}
+	if err := w.openLogFile(); err != nil {
 		t.Fatalf("new: %v", err)
 	}
 	defer w.Close()
