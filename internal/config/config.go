@@ -137,6 +137,9 @@ type ProcessConfig struct {
 	// Each element is a single condition as a {type: value} object.
 	WhenAny []map[string]string `json:"whenAny,omitempty" yaml:"whenAny,omitempty"`
 
+	// ClearEnv starts the child with no inherited environment before Env/bootstrap overlays.
+	ClearEnv bool `json:"clearEnv,omitempty" yaml:"clearEnv,omitempty"`
+
 	// Env is a map of environment variables to set for this process.
 	Env map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
 

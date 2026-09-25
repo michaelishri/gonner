@@ -536,7 +536,11 @@ func (p *Process) ForwardSignal(sig os.Signal) {
 // It inherits the current environment and overlays any per-process env vars.
 func (p *Process) buildEnv() []string {
 	env := []string{}
-	for _, entry := range os.Environ() {
+	inherited := os.Environ()
+	if p.cfg.ClearEnv {
+		inherited = nil
+	}
+	for _, entry := range inherited {
 		if !strings.HasPrefix(entry, "GONNER_INSTANCE_ID=") && !strings.HasPrefix(entry, "GONNER_GENERATION=") {
 			env = append(env, entry)
 		}

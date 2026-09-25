@@ -109,3 +109,12 @@ func TestCleanExitStillStopsByDefault(t *testing.T) {
 		t.Fatal("legacy clean exit restarted")
 	}
 }
+
+func TestClearEnvironmentRetainsOnlyExplicitValues(t *testing.T) {
+	t.Setenv("ORIGIN_INHERITED_SENTINEL", "must-not-reach-child")
+	p := NewProcess(config.ProcessConfig{ClearEnv: true, Env: map[string]string{"PATH": "/usr/bin:/bin"}}, 0, time.Second, nil)
+	env := p.buildEnv()
+	if len(env) != 1 || env[0] != "PATH=/usr/bin:/bin" {
+		t.Fatal("inherited environment escaped")
+	}
+}
