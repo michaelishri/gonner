@@ -25,7 +25,9 @@ jobs:
 
       - name: Test
         run: |
+          go mod download all
           go mod verify
+          git diff --exit-code -- go.mod go.sum
           test -z "$(gofmt -l $(git ls-files '*.go'))"
           go vet ./...
           go test -race -timeout=180s ./...
