@@ -418,6 +418,7 @@ func (p *Process) runCommand(ctx context.Context) (int, error) {
 	p.previousReaped = reaped
 	close(p.cmdDone)
 	p.currentCmd = nil
+	p.state.Store(StateStopped)
 	p.mu.Unlock()
 
 	if !reaped && p.cfg.Controllable {

@@ -118,3 +118,25 @@ func TestClearEnvironmentRetainsOnlyExplicitValues(t *testing.T) {
 		t.Fatal("inherited environment escaped")
 	}
 }
+
+func TestNaturalExitIsNotReportedRunningDuringBackoff(t *testing.T) {
+	cfg := config.ProcessConfig{Name: "recycle", Instances: 1, Command: "exit 0", AutoRestart: true, RestartOnSuccess: true, Controllable: true,
+		Backoff: &config.BackoffConfig{InitialDelay: config.Duration(time.Second), MaxDelay: config.Duration(time.Second), Multiplier: 1}}
+	p := NewProcess(cfg, 0, time.Second, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = p.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		info := p.instanceInfo()
+		if info.PreviousReaped {
+			if info.State == StateRunning {
+				t.Fatal("reaped command reported running")
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("exit never confirmed")
+}
