@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -46,17 +48,22 @@ type ProcessInfo struct {
 
 // Process manages a single process (or one instance of a multi-instance process).
 type Process struct {
-	cfg             config.ProcessConfig
-	instanceID      int
-	state           atomic.Value // ProcessState
-	logWriter       *logging.Writer
-	backoff         *Backoff
-	restarts        int
-	startedAt       time.Time
-	currentCmd      *exec.Cmd
-	cmdDone         chan struct{}
-	shutdownTimeout time.Duration
-	mu              sync.Mutex
+	cfg                config.ProcessConfig
+	instanceID         int
+	state              atomic.Value // ProcessState
+	logWriter          *logging.Writer
+	backoff            *Backoff
+	restarts           int
+	startedAt          time.Time
+	currentCmd         *exec.Cmd
+	cmdDone            chan struct{}
+	shutdownTimeout    time.Duration
+	mu                 sync.Mutex
+	generation         string
+	previousGeneration string
+	previousReaped     bool
+	restartRequested   bool
+	generationStop     func(time.Duration) error
 
 	readyCh        chan struct{}
 	doneCh         chan struct{}
@@ -186,7 +193,7 @@ func (p *Process) Run(ctx context.Context) error {
 
 		if err != nil {
 			logging.Gonner("Process %q exited with error: %v", name, err)
-		} else if exitCode == 0 {
+		} else if exitCode == 0 && !p.cfg.RestartOnSuccess && !p.requestedRestart() {
 			logging.Gonner("Process %q exited normally (code 0)", name)
 			p.state.Store(StateStopped)
 			return nil
@@ -194,7 +201,7 @@ func (p *Process) Run(ctx context.Context) error {
 			logging.Gonner("Process %q exited with code %d", name, exitCode)
 		}
 
-		if p.cfg.Critical {
+		if p.cfg.Critical && !p.requestedRestart() {
 			p.state.Store(StateFailed)
 			logging.Gonner("CRITICAL: Process %q failed — triggering full shutdown", name)
 			if p.onCriticalExit != nil {
@@ -301,6 +308,20 @@ func (p *Process) runCommand(ctx context.Context) (int, error) {
 		return -1, fmt.Errorf("creating stderr pipe: %w", err)
 	}
 
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return -1, err
+	}
+	generation := hex.EncodeToString(nonce[:])
+	cmd.Env = append(cmd.Environ(), "GONNER_INSTANCE_ID="+p.Name(), "GONNER_GENERATION="+generation)
+	var stopOnce sync.Once
+	var stopErr error
+	stop := func(grace time.Duration) error {
+		stopOnce.Do(func() { stopErr = p.stopProcessGroupFor(cmd.Process.Pid, grace) })
+		return stopErr
+	}
+	cmd.Cancel = func() error { return stop(p.stopTimeout()) }
+
 	// Refresh ready channel so dependants of this restart can re-arm if needed.
 	p.mu.Lock()
 	if p.readyCh == nil {
@@ -321,6 +342,9 @@ func (p *Process) runCommand(ctx context.Context) (int, error) {
 
 	p.mu.Lock()
 	p.currentCmd = cmd
+	p.generation = generation
+	p.generationStop = stop
+	p.restartRequested = false
 	p.cmdDone = make(chan struct{})
 	p.startedAt = time.Now()
 	readyCh := p.readyCh
@@ -386,11 +410,21 @@ func (p *Process) runCommand(ctx context.Context) (int, error) {
 	_, _ = io.Copy(io.Discard, stdoutPipe)
 	_, _ = io.Copy(io.Discard, stderrPipe)
 
+	// Confirmation is stronger than accepting a signal: Wait has finished and
+	// the original process group must have disappeared before replacement.
+	reaped := waitGroupGone(pid, time.Second)
 	p.mu.Lock()
+	p.previousGeneration = generation
+	p.previousReaped = reaped
 	close(p.cmdDone)
 	p.currentCmd = nil
 	p.mu.Unlock()
 
+	if !reaped && p.cfg.Controllable {
+		// Never launch a replacement while old descendants may still exist.
+		p.state.Store(StateFailed)
+		<-ctx.Done()
+	}
 	return exitCode, waitErr
 }
 
@@ -419,7 +453,19 @@ func (p *Process) newCommand(ctx context.Context, command, workDir string) (*exe
 // stopProcessGroup waits for the entire group, not just its original shell.
 // Setpgid makes the child's PID its PGID, which stays valid after the shell exits.
 // Do not wait on cmdDone here: exec.Cmd.Wait itself waits for Cancel to return.
+func (p *Process) stopTimeout() time.Duration {
+	timeout := time.Duration(p.cfg.StopTimeout)
+	if timeout <= 0 {
+		timeout = p.shutdownTimeout
+	}
+	return timeout
+}
+
 func (p *Process) stopProcessGroup(pgid int) error {
+	return p.stopProcessGroupFor(pgid, p.stopTimeout())
+}
+
+func (p *Process) stopProcessGroupFor(pgid int, timeout time.Duration) error {
 	if err := syscall.Kill(-pgid, parseSignal(p.cfg.StopSignal)); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return os.ErrProcessDone
@@ -431,10 +477,6 @@ func (p *Process) stopProcessGroup(pgid int) error {
 	p.state.Store(StateStopping)
 	p.mu.Unlock()
 
-	timeout := time.Duration(p.cfg.StopTimeout)
-	if timeout <= 0 {
-		timeout = p.shutdownTimeout
-	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
@@ -493,12 +535,16 @@ func (p *Process) ForwardSignal(sig os.Signal) {
 // buildEnv returns the environment for child processes.
 // It inherits the current environment and overlays any per-process env vars.
 func (p *Process) buildEnv() []string {
-	if len(p.cfg.Env) == 0 {
-		return nil
+	env := []string{}
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "GONNER_INSTANCE_ID=") && !strings.HasPrefix(entry, "GONNER_GENERATION=") {
+			env = append(env, entry)
+		}
 	}
-	env := os.Environ()
 	for k, v := range p.cfg.Env {
-		env = append(env, k+"="+v)
+		if k != "GONNER_INSTANCE_ID" && k != "GONNER_GENERATION" {
+			env = append(env, k+"="+v)
+		}
 	}
 	return env
 }

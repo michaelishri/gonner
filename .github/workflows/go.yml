@@ -18,10 +18,15 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: 1.26.6
 
       - name: Build
         run: go build -v ./...
 
       - name: Test
-        run: go test -v ./...
+        run: |
+          go mod verify
+          test -z "$(gofmt -l $(git ls-files '*.go'))"
+          go vet ./...
+          go test -race -timeout=180s ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
