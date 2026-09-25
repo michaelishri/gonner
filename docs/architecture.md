@@ -71,7 +71,7 @@ To add a new condition type, implement `Condition` and call `condition.Register(
   - the signal handler (via the `cancelFn` it owns),
   - each `Process.Run` (via `errgroup.WithContext`),
   - the health server (graceful shutdown).
-- **errgroup.** `Manager.Run` launches every process in an `errgroup.Group`. A returned error or context cancellation triggers shutdown of the remaining processes via `Manager.shutdownAll`.
+- **errgroup.** `Manager.Run` launches every process in an `errgroup.Group`. A returned error or context cancellation triggers each active command's graceful shutdown. The manager waits for all started lifecycles to finish, including when cancellation interrupts sequential startup.
 - **Per-process goroutines.** Each instance has its own goroutine running `Process.Run`. Within that, the process spawns two more for stdout/stderr line scanning.
 - **`readyCh` / `doneCh`.** Channels per process used by `dependsOn` waiters in `parallel` mode and the next-up sequencer in `sequential` mode.
 - **Mutex.** `Process.mu` guards `currentCmd`, `cmdDone`, `startedAt`, `restarts`, `readyCh`. State itself is an `atomic.Value` so `State()` is lock-free.
@@ -92,13 +92,14 @@ This avoids the classic "reaper-vs-exec.Cmd" race that plagues PID-1 supervisors
 
 1. Trigger: SIGTERM/SIGINT received, **or** a critical process exits unexpectedly, **or** the outer context is cancelled.
 2. `SignalHandler` (or `Process.onCriticalExit`) calls the top `cancelFn`.
-3. The errgroup's context is cancelled; every `Process.Run` checks the context and stops looping.
-4. `Manager.shutdownAll` iterates remaining processes and calls `Process.Stop` concurrently:
-   - send the configured `stopSignal` to the process group,
-   - wait up to `stopTimeout` (per-process) or `shutdownTimeout` (global),
-   - escalate to SIGKILL if still alive.
+3. The errgroup's context is cancelled; the manager marks itself as shutting down, and process lifecycles stop starting or restarting commands.
+4. Each active command's custom `exec.Cmd.Cancel` handler performs graceful shutdown concurrently:
+   - send the configured `stopSignal` to the command's process group,
+   - wait up to `stopTimeout` (per-process) or `shutdownTimeout` (global) for the group to exit,
+   - escalate to SIGKILL for remaining group members, even if the original shell has already exited.
+   Both `commandsBefore` and main commands use this path. Each command has its own process group; its initial PID remains the group ID after the shell exits. Any descendants left in that group when a command exits normally are also stopped before the lifecycle advances. Descendants that create a separate session or process group are outside this group-based shutdown mechanism.
 5. Health server's shutdown goroutine completes within 5s.
-6. `Manager.Run` returns; gonner exits with the errgroup's error (if any).
+6. After all started process lifecycles finish shutdown and reap their direct children, `Manager.Run` returns; gonner exits with the errgroup's error (if any).
 
 ---
 

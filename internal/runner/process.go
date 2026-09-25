@@ -162,6 +162,10 @@ func (p *Process) Run(ctx context.Context) error {
 	// Run commandsBefore
 	p.state.Store(StateStarting)
 	if err := p.runCommandsBefore(ctx); err != nil {
+		if ctx.Err() != nil {
+			p.state.Store(StateStopped)
+			return nil
+		}
 		p.state.Store(StateFailed)
 		logging.Gonner("Process %q failed during commandsBefore: %v", name, err)
 		return nil
@@ -225,6 +229,9 @@ func (p *Process) Run(ctx context.Context) error {
 // runCommandsBefore executes pre-commands sequentially.
 func (p *Process) runCommandsBefore(ctx context.Context) error {
 	for i, preCmd := range p.cfg.CommandsBefore {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		logging.Gonner("Running commandsBefore[%d] for %q: %s", i, p.Name(), preCmd.Command)
 
 		workDir := preCmd.WorkDir
@@ -232,12 +239,8 @@ func (p *Process) runCommandsBefore(ctx context.Context) error {
 			workDir = p.cfg.WorkDir
 		}
 
-		cmd := exec.CommandContext(ctx, "sh", "-c", preCmd.Command)
-		if workDir != "" {
-			cmd.Dir = workDir
-		}
-		cmd.Env = p.buildEnv()
-		if err := applyCredential(cmd, p.cfg.User, p.cfg.Group); err != nil {
+		cmd, err := p.newCommand(ctx, preCmd.Command, workDir)
+		if err != nil {
 			if preCmd.ContinueOnError {
 				logging.Gonner("commandsBefore[%d] for %q credential error (continuing): %v", i, p.Name(), err)
 				continue
@@ -256,10 +259,19 @@ func (p *Process) runCommandsBefore(ctx context.Context) error {
 			return fmt.Errorf("commandsBefore[%d] failed to start: %w", i, err)
 		}
 
-		go logging.LineScanner(stdout, p.logWriter)
-		go logging.LineScanner(stderr, p.logWriter)
+		var wg sync.WaitGroup
+		wg.Go(func() { logging.LineScanner(stdout, p.logWriter) })
+		wg.Go(func() { logging.LineScanner(stderr, p.logWriter) })
 
-		if err := cmd.Wait(); err != nil {
+		waitErr := cmd.Wait()
+		// The shell can exit before its descendants. Finish stopping the
+		// group before advancing to another command or closing its log writer.
+		_ = cmd.Cancel()
+		wg.Wait()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := waitErr; err != nil {
 			if preCmd.ContinueOnError {
 				logging.Gonner("commandsBefore[%d] for %q failed (continuing): %v", i, p.Name(), err)
 				continue
@@ -275,13 +287,8 @@ func (p *Process) runCommandsBefore(ctx context.Context) error {
 // runCommand executes the main command once and waits for it to exit.
 // Returns the exit code and any error.
 func (p *Process) runCommand(ctx context.Context) (int, error) {
-	cmd := exec.CommandContext(ctx, "sh", "-c", p.cfg.Command)
-	if p.cfg.WorkDir != "" {
-		cmd.Dir = p.cfg.WorkDir
-	}
-	cmd.Env = p.buildEnv()
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := applyCredential(cmd, p.cfg.User, p.cfg.Group); err != nil {
+	cmd, err := p.newCommand(ctx, p.cfg.Command, p.cfg.WorkDir)
+	if err != nil {
 		return -1, fmt.Errorf("setting credential: %w", err)
 	}
 
@@ -317,9 +324,11 @@ func (p *Process) runCommand(ctx context.Context) (int, error) {
 	p.cmdDone = make(chan struct{})
 	p.startedAt = time.Now()
 	readyCh := p.readyCh
+	if ctx.Err() == nil {
+		p.state.Store(StateRunning)
+	}
 	p.mu.Unlock()
 
-	p.state.Store(StateRunning)
 	p.backoff.RecordStart()
 
 	// Signal readiness once.
@@ -345,11 +354,6 @@ func (p *Process) runCommand(ctx context.Context) (int, error) {
 	}()
 
 	waitErr := cmd.Wait()
-	wg.Wait()
-
-	_, _ = io.Copy(io.Discard, stdoutPipe)
-	_, _ = io.Copy(io.Discard, stderrPipe)
-
 	exitCode := 0
 	pid := cmd.Process.Pid
 
@@ -372,6 +376,16 @@ func (p *Process) runCommand(ctx context.Context) (int, error) {
 		ReapedStatuses.Delete(pid)
 	}
 
+	// Retain the original process group even if the shell has already exited.
+	// This also prevents background descendants from surviving a normal exit
+	// or being left behind when the main command restarts. Claim any reaped
+	// exit status above before cleanup can wait long enough for it to expire.
+	_ = cmd.Cancel()
+	wg.Wait()
+
+	_, _ = io.Copy(io.Discard, stdoutPipe)
+	_, _ = io.Copy(io.Discard, stderrPipe)
+
 	p.mu.Lock()
 	close(p.cmdDone)
 	p.currentCmd = nil
@@ -380,8 +394,70 @@ func (p *Process) runCommand(ctx context.Context) (int, error) {
 	return exitCode, waitErr
 }
 
-// Stop sends the configured stop signal to the process and waits for it to exit.
-// If the process doesn't exit within the timeout, SIGKILL is sent.
+// newCommand gives both startup and main commands their own process group and
+// replaces CommandContext's immediate Process.Kill with bounded group shutdown.
+func (p *Process) newCommand(ctx context.Context, command, workDir string) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd.Dir = workDir
+	cmd.Env = p.buildEnv()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := applyCredential(cmd, p.cfg.User, p.cfg.Group); err != nil {
+		return nil, err
+	}
+
+	var stopOnce sync.Once
+	var stopErr error
+	cmd.Cancel = func() error {
+		stopOnce.Do(func() {
+			stopErr = p.stopProcessGroup(cmd.Process.Pid)
+		})
+		return stopErr
+	}
+	return cmd, nil
+}
+
+// stopProcessGroup waits for the entire group, not just its original shell.
+// Setpgid makes the child's PID its PGID, which stays valid after the shell exits.
+// Do not wait on cmdDone here: exec.Cmd.Wait itself waits for Cancel to return.
+func (p *Process) stopProcessGroup(pgid int) error {
+	if err := syscall.Kill(-pgid, parseSignal(p.cfg.StopSignal)); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+
+	p.mu.Lock()
+	p.state.Store(StateStopping)
+	p.mu.Unlock()
+
+	timeout := time.Duration(p.cfg.StopTimeout)
+	if timeout <= 0 {
+		timeout = p.shutdownTimeout
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) {
+			return nil
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			logging.Gonner("Process %q did not exit within %s, sending SIGKILL", p.Name(), timeout)
+			if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return err
+			}
+			return nil
+		}
+	}
+}
+
+// Stop sends the configured stop signal to the process group, escalates to
+// SIGKILL after the timeout, and waits for the command to be reaped.
 func (p *Process) Stop() {
 	p.mu.Lock()
 	cmd := p.currentCmd
@@ -392,37 +468,15 @@ func (p *Process) Stop() {
 		return
 	}
 
-	p.state.Store(StateStopping)
-
-	stopSig := parseSignal(p.cfg.StopSignal)
-	timeout := time.Duration(p.cfg.StopTimeout)
-	if timeout <= 0 {
-		timeout = p.shutdownTimeout
-	}
-
-	if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
-		_ = syscall.Kill(-pgid, stopSig)
-	} else {
-		_ = cmd.Process.Signal(stopSig)
-	}
-
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		logging.Gonner("Process %q did not exit within %s, sending SIGKILL", p.Name(), timeout)
-		if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		} else {
-			_ = cmd.Process.Kill()
-		}
-	}
+	_ = cmd.Cancel()
+	<-done
 }
 
 // ForwardSignal sends a signal to the process group.
 func (p *Process) ForwardSignal(sig os.Signal) {
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	cmd := p.currentCmd
-	p.mu.Unlock()
 
 	if cmd == nil || cmd.Process == nil {
 		return
@@ -433,11 +487,7 @@ func (p *Process) ForwardSignal(sig os.Signal) {
 		return
 	}
 
-	if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
-		_ = syscall.Kill(-pgid, sysSignal)
-	} else {
-		_ = cmd.Process.Signal(sig)
-	}
+	_ = syscall.Kill(-cmd.Process.Pid, sysSignal)
 }
 
 // buildEnv returns the environment for child processes.

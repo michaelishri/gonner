@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.0.3
+
+### Added
+
+- Nine isolated shutdown regression cases covering signals, shell-wrapped children, timeout escalation, startup commands, and critical-process failure.
+
+### Fixed
+
+- SIGTERM and SIGINT now honor the configured `stopSignal` and `stopTimeout` for the entire process group instead of immediately killing the directly launched process.
+- Descendants are stopped even after their original shell exits, including when a command exits normally or is about to restart.
+- `commandsBefore` now uses the same graceful process-group shutdown as main commands, and its log readers finish before the log writer closes.
+- Cancellation during sequential startup now waits for already-started processes to finish shutting down.
+- Shutdown status now updates when cancellation begins, and cancelled startup commands are reported as stopped rather than failed.
+
 ## v0.0.2-alpha
 
 ### Added
