@@ -85,10 +85,18 @@ func (m *Manager) Run(ctx context.Context) error {
 	logging.Gonner("Starting %d process(es) in %s mode", len(m.processes), m.cfg.Mode)
 
 	g, gCtx := errgroup.WithContext(ctx)
+	stopShutdownWatch := context.AfterFunc(gCtx, func() {
+		m.shuttingDown.Store(true)
+	})
+	defer stopShutdownWatch()
 
 	if m.cfg.Mode == "sequential" {
 		// Sequential: start each process config one at a time
+	startup:
 		for _, procCfg := range runnableConfigs {
+			if gCtx.Err() != nil {
+				break
+			}
 			procCfg := procCfg // capture for closure
 			procs := readyMap[procCfg.Name]
 
@@ -108,7 +116,8 @@ func (m *Manager) Run(ctx context.Context) error {
 				case <-procs[0].Done():
 					// Process exited before becoming ready; continue to next
 				case <-gCtx.Done():
-					return gCtx.Err()
+					// Already-started processes still need to finish shutdown.
+					break startup
 				}
 			}
 		}
@@ -139,37 +148,13 @@ func (m *Manager) Run(ctx context.Context) error {
 		}
 	}
 
-	// Wait for all goroutines
+	// Each command handles cancellation using its configured stop signal and
+	// timeout. Join all lifecycles before returning, including during startup.
 	err := g.Wait()
-
-	// Mark as shutting down before stopping remaining processes
 	m.shuttingDown.Store(true)
-
-	// Gracefully stop any still-running processes
-	m.shutdownAll()
 
 	logging.Gonner("All processes have exited")
 	return err
-}
-
-// shutdownAll sends SIGTERM to all running processes and waits for them to exit.
-func (m *Manager) shutdownAll() {
-	m.mu.RLock()
-	procs := make([]*Process, len(m.processes))
-	copy(procs, m.processes)
-	m.mu.RUnlock()
-
-	var wg sync.WaitGroup
-	for _, proc := range procs {
-		if proc.State() == StateRunning || proc.State() == StateStarting {
-			wg.Add(1)
-			go func(p *Process) {
-				defer wg.Done()
-				p.Stop()
-			}(proc)
-		}
-	}
-	wg.Wait()
 }
 
 // Processes returns info about all managed processes.
