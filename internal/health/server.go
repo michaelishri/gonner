@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/michaelishri/gonner/internal/config"
@@ -29,9 +30,12 @@ type Options struct {
 
 // Server is the HTTP health endpoint server.
 type Server struct {
-	opts    Options
-	manager *runner.Manager
-	server  *http.Server
+	opts     Options
+	manager  *runner.Manager
+	server   *http.Server
+	listener net.Listener
+	errors   chan error
+	done     chan struct{}
 }
 
 // NewServer creates a new health server with default options.
@@ -45,12 +49,23 @@ func NewServerWithOptions(opts Options, manager *runner.Manager) *Server {
 	if opts.BindAddr == "" {
 		opts.BindAddr = "0.0.0.0"
 	}
-	return &Server{opts: opts, manager: manager}
+	return &Server{opts: opts, manager: manager, errors: make(chan error, 1), done: make(chan struct{})}
 }
 
 // Start starts the HTTP server in a goroutine. It shuts down gracefully when ctx is cancelled.
 // Returns an error if the server cannot bind to the configured address.
 func (s *Server) Start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var tlsConfig *tls.Config
+	if s.opts.TLS != nil {
+		cert, err := tls.LoadX509KeyPair(s.opts.TLS.CertFile, s.opts.TLS.KeyFile)
+		if err != nil {
+			return fmt.Errorf("loading health TLS certificate: %w", err)
+		}
+		tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/health", s.handleHealth) // public liveness probe
@@ -60,7 +75,7 @@ func (s *Server) Start(ctx context.Context) error {
 		mux.HandleFunc("/metrics", s.authMiddleware(s.handleMetrics))
 	}
 
-	addr := fmt.Sprintf("%s:%d", s.opts.BindAddr, s.opts.Port)
+	addr := net.JoinHostPort(s.opts.BindAddr, strconv.Itoa(s.opts.Port))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("health endpoint failed to listen on %s: %w", addr, err)
@@ -76,37 +91,32 @@ func (s *Server) Start(ctx context.Context) error {
 		MaxHeaderBytes:    1 << 16, // 64 KiB
 	}
 
-	// TLS hardening: require modern protocol versions when serving HTTPS.
-	if s.opts.TLS != nil {
-		s.server.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	s.server.TLSConfig = tlsConfig
+	if tlsConfig != nil {
+		listener = tls.NewListener(listener, tlsConfig)
 	}
-
+	s.listener = listener
+	serveDone := make(chan struct{})
 	go func() {
-		defer logging.Recover("health-server")
-		scheme := "http"
-		if s.opts.TLS != nil {
-			scheme = "https"
-		}
-		logging.Gonner("Health endpoint listening on %s://%s", scheme, addr)
-
-		var serveErr error
-		if s.opts.TLS != nil {
-			serveErr = s.server.ServeTLS(listener, s.opts.TLS.CertFile, s.opts.TLS.KeyFile)
-		} else {
-			serveErr = s.server.Serve(listener)
-		}
-		if serveErr != nil && serveErr != http.ErrServerClosed {
-			logging.Gonner("Health server error: %v", serveErr)
+		defer close(serveDone)
+		defer close(s.errors)
+		logging.Gonner("Health endpoint listening on %s", listener.Addr())
+		if err := s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			s.errors <- fmt.Errorf("health server: %w", err)
 		}
 	}()
-
 	go func() {
-		defer logging.Recover("health-shutdown")
-		<-ctx.Done()
-		logging.Gonner("Shutting down health endpoint...")
+		defer close(s.done)
+		select {
+		case <-ctx.Done():
+		case <-serveDone:
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = s.server.Shutdown(shutdownCtx)
+		if err := s.server.Shutdown(shutdownCtx); err != nil {
+			_ = s.server.Close()
+		}
+		<-serveDone
 	}()
 
 	return nil
@@ -128,3 +138,9 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
+// Errors reports an unexpected serving failure; normal shutdown closes it.
+func (s *Server) Errors() <-chan error { return s.errors }
+
+// Done is closed once the listener and active handlers have shut down.
+func (s *Server) Done() <-chan struct{} { return s.done }

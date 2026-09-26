@@ -52,11 +52,11 @@ A running process is not application readiness. Consumers must independently
 check worker readiness and verify matching generation/protocol before routing.
 This socket grants lifecycle authority to its UID; it is not a tenant-facing API.
 
-The control feature is built and audited with Go 1.26.6, matching the warm-service
-consumer. The older local Go 1.26 runtime reported reachable standard-library
-advisories; rerunning with 1.26.6 reports no reachable vulnerabilities. CI now
-runs module verification, formatting, vet, the race suite and govulncheck. The
-new x/sys v0.40.0 dependency is used only for peer credentials on Unix sockets.
+The control feature retains the audited main-branch Go 1.26.7 and x/sys v0.48.0
+baseline. CI runs module verification, formatting, vet, Linux/macOS race suites,
+PID 1 container tests and source/release vulnerability scans. Generation-scoped
+restart requests use the shared execution service, preserving its child-wait,
+output-drain, privilege and signal-error handling.
 
 Credential workers should set `clearEnv: true` and provide only an explicit
 non-secret Env allowlist. The default preserves inherited environment for existing

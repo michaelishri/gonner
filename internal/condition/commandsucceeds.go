@@ -2,32 +2,38 @@ package condition
 
 import (
 	"context"
-	"os/exec"
+	"errors"
+	"syscall"
 	"time"
+
+	"github.com/michaelishri/gonner/internal/execution"
 )
 
-// CommandSucceedsCondition runs a shell command and returns true if it exits 0.
-// Format: the raw shell command string. A default 10s timeout is applied.
 type CommandSucceedsCondition struct {
 	command string
 	timeout time.Duration
+	service *execution.Service
+	spec    execution.Spec
 }
 
-// NewCommandSucceedsCondition creates a CommandSucceeds condition.
 func NewCommandSucceedsCondition(value string) Condition {
-	return &CommandSucceedsCondition{command: value, timeout: 10 * time.Second}
+	return &CommandSucceedsCondition{command: value, timeout: 10 * time.Second, service: execution.NewService()}
 }
-
-// Type returns "commandSucceeds".
 func (c *CommandSucceedsCondition) Type() string { return "commandSucceeds" }
-
-// Evaluate executes the command via sh -c and returns true if exit code is 0.
-func (c *CommandSucceedsCondition) Evaluate() (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+func (c *CommandSucceedsCondition) Evaluate(parent context.Context) (bool, error) {
+	ctx, cancel := context.WithTimeout(parent, c.timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", c.command)
-	if err := cmd.Run(); err != nil {
-		return false, nil
+	spec := c.spec
+	spec.Command = c.command
+	spec.StopSignal = syscall.SIGKILL
+	spec.StopTimeout = time.Second
+	r := c.service.Run(ctx, spec)
+	var supervisor *execution.SupervisorError
+	if errors.As(r.Err, &supervisor) {
+		return false, r.Err
 	}
-	return true, nil
+	if parent.Err() != nil {
+		return false, parent.Err()
+	}
+	return ctx.Err() == nil && r.Err == nil && r.ExitCode == 0, nil
 }

@@ -52,7 +52,16 @@ func TestStrictControlRequests(t *testing.T) {
 }
 
 func TestUnixSocketProtectionAndLifecycle(t *testing.T) {
-	dir := t.TempDir()
+	// Use a short canonical directory: macOS TMPDIR can exceed Unix path limits.
+	dir, err := os.MkdirTemp("/tmp", "gonner-control-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir, err = filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	os.Chmod(dir, 0700)
 	cfg := config.ControlConfig{Socket: filepath.Join(dir, "control.sock")}
 	ctx, cancel := context.WithCancel(context.Background())

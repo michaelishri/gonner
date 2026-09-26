@@ -16,7 +16,6 @@ type Backoff struct {
 	maxDelay     time.Duration
 	multiplier   float64
 	attempt      int
-	lastStart    time.Time
 }
 
 // NewBackoff creates a Backoff from config. If cfg is nil, defaults are used.
@@ -32,14 +31,12 @@ func NewBackoff(cfg *config.BackoffConfig) *Backoff {
 	}
 }
 
-// RecordStart records that the process has just started.
-// If it was running longer than maxDelay, the backoff counter resets (stability).
-func (b *Backoff) RecordStart() {
-	now := time.Now()
-	if !b.lastStart.IsZero() && now.Sub(b.lastStart) > b.maxDelay {
+// RecordExit resets escalation only after actual stable runtime. Restart delay
+// and post-exit cleanup must never count toward stability.
+func (b *Backoff) RecordExit(runtime time.Duration) {
+	if runtime > b.maxDelay {
 		b.attempt = 0
 	}
-	b.lastStart = now
 }
 
 // Next returns the delay to wait before the next restart attempt.
@@ -72,5 +69,4 @@ func (b *Backoff) Wait(ctx context.Context) bool {
 // Reset resets the backoff counter.
 func (b *Backoff) Reset() {
 	b.attempt = 0
-	b.lastStart = time.Time{}
 }

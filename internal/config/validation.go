@@ -194,8 +194,15 @@ func ValidateWithWarnings(cfg *Config) (*ValidationResult, error) {
 	}
 
 	// Validate dependsOn references and detect cycles
+	order := make(map[string]int)
+	for i, p := range cfg.Run {
+		order[p.Name] = i
+	}
 	for _, proc := range cfg.Run {
 		for _, dep := range proc.DependsOn {
+			if cfg.Mode == "sequential" && names[dep] && order[dep] > order[proc.Name] {
+				errs = append(errs, fmt.Sprintf("%s: sequential dependsOn %q must appear earlier in run", proc.Name, dep))
+			}
 			if !names[dep] {
 				errs = append(errs, fmt.Sprintf("%s: dependsOn references unknown process %q", proc.Name, dep))
 			}

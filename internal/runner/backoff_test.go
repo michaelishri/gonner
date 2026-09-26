@@ -108,7 +108,7 @@ func TestBackoff_Reset(t *testing.T) {
 	}
 }
 
-func TestBackoff_RecordStart_ResetAfterStability(t *testing.T) {
+func TestBackoff_RecordExit_ResetAfterStability(t *testing.T) {
 	b := NewBackoff(&config.BackoffConfig{
 		InitialDelay: config.Duration(100 * time.Millisecond),
 		MaxDelay:     config.Duration(1 * time.Second),
@@ -122,8 +122,7 @@ func TestBackoff_RecordStart_ResetAfterStability(t *testing.T) {
 	currentAttempt := b.attempt
 
 	// Simulate start a long time ago (stable process)
-	b.lastStart = time.Now().Add(-2 * time.Second) // > maxDelay
-	b.RecordStart()
+	b.RecordExit(2 * time.Second) // > maxDelay
 
 	if b.attempt != 0 {
 		t.Errorf("attempt should reset after stable period: got %d (was %d)", b.attempt, currentAttempt)

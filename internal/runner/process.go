@@ -8,9 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"os/user"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +15,7 @@ import (
 	"time"
 
 	"github.com/michaelishri/gonner/internal/config"
+	"github.com/michaelishri/gonner/internal/execution"
 	"github.com/michaelishri/gonner/internal/logging"
 )
 
@@ -46,504 +44,256 @@ type ProcessInfo struct {
 	Critical         bool         `json:"critical"`
 }
 
-// Process manages a single process (or one instance of a multi-instance process).
+// Process owns one configured instance and a stable initial-start gate.
 type Process struct {
-	cfg                config.ProcessConfig
-	instanceID         int
-	state              atomic.Value // ProcessState
-	logWriter          *logging.Writer
-	backoff            *Backoff
-	restarts           int
-	startedAt          time.Time
-	currentCmd         *exec.Cmd
-	cmdDone            chan struct{}
-	shutdownTimeout    time.Duration
-	mu                 sync.Mutex
-	generation         string
-	previousGeneration string
-	previousReaped     bool
-	restartRequested   bool
-	generationStop     func(time.Duration) error
-
-	readyCh        chan struct{}
-	doneCh         chan struct{}
-	onCriticalExit func()
+	cfg                     config.ProcessConfig
+	instanceID              int
+	state                   atomic.Value
+	logWriter               *logging.Writer
+	service                 *execution.Service
+	credential              *syscall.Credential
+	backoff                 *Backoff
+	shutdownTimeout         time.Duration
+	mu                      sync.Mutex
+	restarts, launches, pid int
+	startedAt               time.Time
+	cancel                  context.CancelFunc
+	readyCh, doneCh         chan struct{}
+	readyOnce, doneOnce     sync.Once
+	onCriticalExit          func()
+	generation              string
+	previousGeneration      string
+	previousReaped          bool
+	restartRequested        bool
+	generationStop          chan<- time.Duration
 }
 
-// NewProcess creates a new Process instance.
-func NewProcess(
-	cfg config.ProcessConfig,
-	instanceID int,
-	shutdownTimeout time.Duration,
-	onCriticalExit func(),
-) *Process {
-	p := &Process{
-		cfg:             cfg,
-		instanceID:      instanceID,
-		backoff:         NewBackoff(cfg.Backoff),
-		shutdownTimeout: shutdownTimeout,
-		readyCh:         make(chan struct{}),
-		doneCh:          make(chan struct{}),
-		onCriticalExit:  onCriticalExit,
-	}
+func NewProcess(cfg config.ProcessConfig, id int, timeout time.Duration, onCriticalExit func()) *Process {
+	p := &Process{cfg: cfg, instanceID: id, shutdownTimeout: timeout, onCriticalExit: onCriticalExit, service: execution.NewService(), backoff: NewBackoff(cfg.Backoff), readyCh: make(chan struct{}), doneCh: make(chan struct{})}
+	p.service.Diagnostic = logging.Gonner
 	p.state.Store(StatePending)
 	return p
 }
-
-// Name returns the display name for this process (includes instance ID if needed).
 func (p *Process) Name() string {
 	if p.cfg.Instances > 1 {
 		return fmt.Sprintf("%s/%d", p.cfg.Name, p.instanceID)
 	}
 	return p.cfg.Name
 }
+func (p *Process) State() ProcessState { return p.state.Load().(ProcessState) }
 
-// State returns the current state.
-func (p *Process) State() ProcessState {
-	return p.state.Load().(ProcessState)
+// Ready is closed on the first successful launch and never replaced.
+func (p *Process) Ready() <-chan struct{} { return p.readyCh }
+func (p *Process) Done() <-chan struct{}  { return p.doneCh }
+func (p *Process) finish(state ProcessState) {
+	p.state.Store(state)
+	p.doneOnce.Do(func() { close(p.doneCh) })
 }
-
-// Ready returns a channel that is closed when the process is running.
-func (p *Process) Ready() <-chan struct{} {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.readyCh
-}
-
-// Done returns a channel that is closed when the process lifecycle is over.
-func (p *Process) Done() <-chan struct{} {
-	return p.doneCh
-}
-
-// Info returns current runtime info.
 func (p *Process) Info() ProcessInfo {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	info := ProcessInfo{
-		Name:     p.Name(),
-		Status:   p.State(),
-		Restarts: p.restarts,
-		Critical: p.cfg.Critical,
-	}
-
-	if p.currentCmd != nil && p.currentCmd.Process != nil {
-		info.PID = p.currentCmd.Process.Pid
-	}
-
-	if !p.startedAt.IsZero() && p.State() == StateRunning {
+	info := ProcessInfo{Name: p.Name(), Status: p.State(), PID: p.pid, Restarts: p.restarts, Critical: p.cfg.Critical}
+	if info.Status == StateRunning && !p.startedAt.IsZero() {
 		info.Uptime = time.Since(p.startedAt).Truncate(time.Second).String()
 	}
-
 	return info
 }
 
-// Run executes the full process lifecycle: commandsBefore, start, monitor, restart.
-// It blocks until the process terminates or the context is cancelled.
-func (p *Process) Run(ctx context.Context) error {
-	defer logging.Recover(fmt.Sprintf("process[%s]", p.Name()))
-	defer close(p.doneCh)
-	name := p.Name()
-
-	// Initialize log writer
-	logOpts := logging.Options{
-		ProcessName: name,
-		LogFilePath: p.cfg.LogFile,
-		LogFileMode: os.FileMode(p.cfg.LogFileMode),
-	}
-	if p.cfg.LogRotate != nil {
-		logOpts.Rotate = &logging.RotateOptions{
-			MaxSizeMB:  p.cfg.LogRotate.MaxSizeMB,
-			MaxBackups: p.cfg.LogRotate.MaxBackups,
-			Compress:   p.cfg.LogRotate.Compress,
-		}
-	}
-	w, err := logging.NewWriterWithOptions(logOpts)
-	if err != nil {
-		p.state.Store(StateFailed)
-		return fmt.Errorf("creating log writer for %s: %w", name, err)
-	}
-	p.logWriter = w
-	defer p.logWriter.Close()
-
-	// Run commandsBefore
-	p.state.Store(StateStarting)
-	if err := p.runCommandsBefore(ctx); err != nil {
-		if ctx.Err() != nil {
-			p.state.Store(StateStopped)
-			return nil
-		}
-		p.state.Store(StateFailed)
-		logging.Gonner("Process %q failed during commandsBefore: %v", name, err)
+// prepare resolves unsafe configuration before any conditions or commands run.
+func (p *Process) prepare() error {
+	if p.logWriter != nil {
 		return nil
 	}
-
-	for {
-		if ctx.Err() != nil {
-			p.state.Store(StateStopped)
-			return nil
-		}
-
-		exitCode, err := p.runCommand(ctx)
-		if ctx.Err() != nil {
-			p.state.Store(StateStopped)
-			logging.Gonner("Process %q stopped (shutdown)", name)
-			return nil
-		}
-
-		if err != nil {
-			logging.Gonner("Process %q exited with error: %v", name, err)
-		} else if exitCode == 0 && !p.cfg.RestartOnSuccess && !p.requestedRestart() {
-			logging.Gonner("Process %q exited normally (code 0)", name)
-			p.state.Store(StateStopped)
-			return nil
-		} else {
-			logging.Gonner("Process %q exited with code %d", name, exitCode)
-		}
-
-		if p.cfg.Critical && !p.requestedRestart() {
-			p.state.Store(StateFailed)
-			logging.Gonner("CRITICAL: Process %q failed — triggering full shutdown", name)
-			if p.onCriticalExit != nil {
-				p.onCriticalExit()
-			}
-			return nil
-		}
-
-		if !p.cfg.AutoRestart {
-			p.state.Store(StateFailed)
-			return nil
-		}
-
-		p.mu.Lock()
-		p.restarts++
-		p.mu.Unlock()
-
-		if p.cfg.MaxRetries > 0 && p.restarts > p.cfg.MaxRetries {
-			p.state.Store(StateFailed)
-			logging.Gonner("Process %q exceeded max retries (%d)", name, p.cfg.MaxRetries)
-			return nil
-		}
-
-		logging.Gonner("Restarting %q (attempt %d)...", name, p.restarts)
-		if !p.backoff.Wait(ctx) {
-			p.state.Store(StateStopped)
-			return nil
-		}
-	}
-}
-
-// runCommandsBefore executes pre-commands sequentially.
-func (p *Process) runCommandsBefore(ctx context.Context) error {
-	for i, preCmd := range p.cfg.CommandsBefore {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		logging.Gonner("Running commandsBefore[%d] for %q: %s", i, p.Name(), preCmd.Command)
-
-		workDir := preCmd.WorkDir
-		if workDir == "" {
-			workDir = p.cfg.WorkDir
-		}
-
-		cmd, err := p.newCommand(ctx, preCmd.Command, workDir)
-		if err != nil {
-			if preCmd.ContinueOnError {
-				logging.Gonner("commandsBefore[%d] for %q credential error (continuing): %v", i, p.Name(), err)
-				continue
-			}
-			return fmt.Errorf("commandsBefore[%d] credential: %w", i, err)
-		}
-
-		stdout, _ := cmd.StdoutPipe()
-		stderr, _ := cmd.StderrPipe()
-
-		if err := cmd.Start(); err != nil {
-			if preCmd.ContinueOnError {
-				logging.Gonner("commandsBefore[%d] for %q failed to start (continuing): %v", i, p.Name(), err)
-				continue
-			}
-			return fmt.Errorf("commandsBefore[%d] failed to start: %w", i, err)
-		}
-
-		var wg sync.WaitGroup
-		wg.Go(func() { logging.LineScanner(stdout, p.logWriter) })
-		wg.Go(func() { logging.LineScanner(stderr, p.logWriter) })
-
-		waitErr := cmd.Wait()
-		// The shell can exit before its descendants. Finish stopping the
-		// group before advancing to another command or closing its log writer.
-		_ = cmd.Cancel()
-		wg.Wait()
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := waitErr; err != nil {
-			if preCmd.ContinueOnError {
-				logging.Gonner("commandsBefore[%d] for %q failed (continuing): %v", i, p.Name(), err)
-				continue
-			}
-			return fmt.Errorf("commandsBefore[%d] failed: %w", i, err)
-		}
-
-		logging.Gonner("commandsBefore[%d] for %q completed", i, p.Name())
-	}
-	return nil
-}
-
-// runCommand executes the main command once and waits for it to exit.
-// Returns the exit code and any error.
-func (p *Process) runCommand(ctx context.Context) (int, error) {
-	cmd, err := p.newCommand(ctx, p.cfg.Command, p.cfg.WorkDir)
+	cred, err := execution.ResolveCredential(p.cfg.User, p.cfg.Group)
 	if err != nil {
-		return -1, fmt.Errorf("setting credential: %w", err)
+		return err
 	}
-
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return -1, fmt.Errorf("creating stdout pipe: %w", err)
+	p.credential = cred
+	opts := logging.Options{ProcessName: p.Name(), LogFilePath: p.cfg.LogFile, LogFileMode: os.FileMode(p.cfg.LogFileMode)}
+	if r := p.cfg.LogRotate; r != nil {
+		opts.Rotate = &logging.RotateOptions{MaxSizeMB: r.MaxSizeMB, MaxBackups: r.MaxBackups, Compress: r.Compress}
 	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return -1, fmt.Errorf("creating stderr pipe: %w", err)
-	}
-
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return -1, err
-	}
-	generation := hex.EncodeToString(nonce[:])
-	cmd.Env = append(cmd.Environ(), "GONNER_INSTANCE_ID="+p.Name(), "GONNER_GENERATION="+generation)
-	var stopOnce sync.Once
-	var stopErr error
-	stop := func(grace time.Duration) error {
-		stopOnce.Do(func() { stopErr = p.stopProcessGroupFor(cmd.Process.Pid, grace) })
-		return stopErr
-	}
-	cmd.Cancel = func() error { return stop(p.stopTimeout()) }
-
-	// Refresh ready channel so dependants of this restart can re-arm if needed.
-	p.mu.Lock()
-	if p.readyCh == nil {
-		p.readyCh = make(chan struct{})
-	} else {
-		select {
-		case <-p.readyCh:
-			// Was closed by previous start — make a fresh one.
-			p.readyCh = make(chan struct{})
-		default:
-		}
-	}
-	p.mu.Unlock()
-
-	if err := cmd.Start(); err != nil {
-		return -1, fmt.Errorf("starting command: %w", err)
-	}
-
-	p.mu.Lock()
-	p.currentCmd = cmd
-	p.generation = generation
-	p.generationStop = stop
-	p.restartRequested = false
-	p.cmdDone = make(chan struct{})
-	p.startedAt = time.Now()
-	readyCh := p.readyCh
-	if ctx.Err() == nil {
-		p.state.Store(StateRunning)
-	}
-	p.mu.Unlock()
-
-	p.backoff.RecordStart()
-
-	// Signal readiness once.
-	select {
-	case <-readyCh:
-	default:
-		close(readyCh)
-	}
-
-	logging.Gonner("Process %q started (PID %d)", p.Name(), cmd.Process.Pid)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		defer logging.Recover("stdout-scanner")
-		logging.LineScanner(stdoutPipe, p.logWriter)
-	}()
-	go func() {
-		defer wg.Done()
-		defer logging.Recover("stderr-scanner")
-		logging.LineScanner(stderrPipe, p.logWriter)
-	}()
-
-	waitErr := cmd.Wait()
-	exitCode := 0
-	pid := cmd.Process.Pid
-
-	// PID-1 reaper may have stolen the wait — recover exit status if so.
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		} else if v, ok := ReapedStatuses.LoadAndDelete(pid); ok {
-			ws := v.(reapedStatus).status
-			exitCode = ws.ExitStatus()
-			if exitCode == 0 {
-				waitErr = nil
-			}
-		} else {
-			exitCode = -1
-		}
-	} else {
-		// Clean exit; drop any stale reaper entry.
-		ReapedStatuses.Delete(pid)
-	}
-
-	// Retain the original process group even if the shell has already exited.
-	// This also prevents background descendants from surviving a normal exit
-	// or being left behind when the main command restarts. Claim any reaped
-	// exit status above before cleanup can wait long enough for it to expire.
-	_ = cmd.Cancel()
-	wg.Wait()
-
-	_, _ = io.Copy(io.Discard, stdoutPipe)
-	_, _ = io.Copy(io.Discard, stderrPipe)
-
-	// Confirmation is stronger than accepting a signal: Wait has finished and
-	// the original process group must have disappeared before replacement.
-	reaped := waitGroupGone(pid, time.Second)
-	p.mu.Lock()
-	p.previousGeneration = generation
-	p.previousReaped = reaped
-	close(p.cmdDone)
-	p.currentCmd = nil
-	p.state.Store(StateStopped)
-	p.mu.Unlock()
-
-	if !reaped && p.cfg.Controllable {
-		// Never launch a replacement while old descendants may still exist.
-		p.state.Store(StateFailed)
-		<-ctx.Done()
-	}
-	return exitCode, waitErr
+	p.logWriter, err = logging.NewWriterWithOptions(opts)
+	return err
 }
-
-// newCommand gives both startup and main commands their own process group and
-// replaces CommandContext's immediate Process.Kill with bounded group shutdown.
-func (p *Process) newCommand(ctx context.Context, command, workDir string) (*exec.Cmd, error) {
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
-	cmd.Dir = workDir
-	cmd.Env = p.buildEnv()
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := applyCredential(cmd, p.cfg.User, p.cfg.Group); err != nil {
-		return nil, err
-	}
-
-	var stopOnce sync.Once
-	var stopErr error
-	cmd.Cancel = func() error {
-		stopOnce.Do(func() {
-			stopErr = p.stopProcessGroup(cmd.Process.Pid)
-		})
-		return stopErr
-	}
-	return cmd, nil
-}
-
-// stopProcessGroup waits for the entire group, not just its original shell.
-// Setpgid makes the child's PID its PGID, which stays valid after the shell exits.
-// Do not wait on cmdDone here: exec.Cmd.Wait itself waits for Cancel to return.
-func (p *Process) stopTimeout() time.Duration {
+func (p *Process) spec(command, dir string) execution.Spec {
 	timeout := time.Duration(p.cfg.StopTimeout)
 	if timeout <= 0 {
 		timeout = p.shutdownTimeout
 	}
-	return timeout
+	return execution.Spec{Command: command, Dir: dir, Env: p.buildEnv(), Credential: p.credential, StopSignal: parseSignal(p.cfg.StopSignal), StopTimeout: timeout, Output: func(r io.Reader) error { return logging.LineScanner(r, p.logWriter) }}
 }
-
-func (p *Process) stopProcessGroup(pgid int) error {
-	return p.stopProcessGroupFor(pgid, p.stopTimeout())
-}
-
-func (p *Process) stopProcessGroupFor(pgid int, timeout time.Duration) error {
-	if err := syscall.Kill(-pgid, parseSignal(p.cfg.StopSignal)); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
+func (p *Process) fail(err error) error {
+	p.state.Store(StateFailed)
+	err = fmt.Errorf("process %q: %w", p.Name(), err)
+	logging.Gonner("%v", err)
+	if p.cfg.Critical && p.onCriticalExit != nil {
+		p.onCriticalExit()
 	}
-
+	return err
+}
+func (p *Process) Run(parent context.Context) error {
+	defer p.doneOnce.Do(func() { close(p.doneCh) })
+	ownedLog := p.logWriter == nil
+	defer func() {
+		if ownedLog && p.logWriter != nil {
+			_ = p.logWriter.Close()
+		}
+	}()
+	if err := p.prepare(); err != nil {
+		return p.fail(err)
+	}
+	// Manager retains log writers until every lifecycle is joined, keeping all
+	// configured paths protected from pruning. Standalone callers own theirs.
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	p.mu.Lock()
-	p.state.Store(StateStopping)
+	p.cancel = cancel
 	p.mu.Unlock()
-
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
+	p.state.Store(StateStarting)
+	if err := p.runCommandsBefore(ctx); err != nil {
+		var supervisor *execution.SupervisorError
+		if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && !errors.As(err, &supervisor) {
+			p.state.Store(StateStopped)
+			return nil
+		}
+		return p.fail(err)
+	}
+	retries := 0
 	for {
-		if errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) {
+		if ctx.Err() != nil {
+			p.state.Store(StateStopped)
 			return nil
 		}
-		select {
-		case <-ticker.C:
-		case <-timer.C:
-			logging.Gonner("Process %q did not exit within %s, sending SIGKILL", p.Name(), timeout)
-			if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-				return err
+		p.state.Store(StateStarting)
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return p.fail(err)
+		}
+		generation := hex.EncodeToString(nonce[:])
+		stopRequest := make(chan time.Duration, 1)
+		spec := p.spec(p.cfg.Command, p.cfg.WorkDir)
+		spec.Env = append(spec.Env, "GONNER_INSTANCE_ID="+p.Name(), "GONNER_GENERATION="+generation)
+		spec.StopRequest = stopRequest
+		spec.ConfirmReaped = p.cfg.Controllable
+		spec.OnStart = func(pid int) {
+			p.mu.Lock()
+			p.pid = pid
+			p.generation = generation
+			p.generationStop = stopRequest
+			p.restartRequested = false
+			p.startedAt = time.Now()
+			if p.launches > 0 {
+				p.restarts++
 			}
+			p.launches++
+			p.state.Store(StateRunning)
+			p.mu.Unlock()
+			p.readyOnce.Do(func() { close(p.readyCh) })
+		}
+		spec.OnExit = func(runtime time.Duration) {
+			p.mu.Lock()
+			p.pid = 0
+			p.state.Store(StateStopping)
+			p.mu.Unlock()
+			p.backoff.RecordExit(runtime)
+		}
+		spec.OnStop = p.markStopping
+		result := p.service.Run(ctx, spec)
+		p.mu.Lock()
+		if result.Started {
+			p.previousGeneration = generation
+			p.previousReaped = result.Reaped
+		}
+		p.generationStop = nil
+		p.state.Store(StateStopped)
+		p.mu.Unlock()
+		var supervisor *execution.SupervisorError
+		if errors.As(result.Err, &supervisor) {
+			return p.fail(result.Err)
+		}
+		if result.Cancelled {
+			p.state.Store(StateStopped)
 			return nil
 		}
+		if result.Err == nil && result.ExitCode == 0 && !p.cfg.RestartOnSuccess && !p.requestedRestart() {
+			p.state.Store(StateStopped)
+			return nil
+		}
+		err := result.Err
+		if err == nil {
+			err = fmt.Errorf("exit status %d", result.ExitCode)
+		}
+		if p.cfg.Critical || !p.cfg.AutoRestart || (p.cfg.MaxRetries > 0 && retries >= p.cfg.MaxRetries) {
+			return p.fail(err)
+		}
+		p.state.Store(StateStarting)
+		logging.Gonner("Restarting %q (retry %d)", p.Name(), retries+1)
+		if !p.backoff.Wait(ctx) {
+			p.state.Store(StateStopped)
+			return nil
+		}
+		// The retry budget counts extra launch attempts; public Restarts counts only
+		// successful launches after the first successful launch, in OnStart.
+		retries++
 	}
 }
-
-// Stop sends the configured stop signal to the process group, escalates to
-// SIGKILL after the timeout, and waits for the command to be reaped.
-func (p *Process) Stop() {
-	p.mu.Lock()
-	cmd := p.currentCmd
-	done := p.cmdDone
-	p.mu.Unlock()
-
-	if cmd == nil || cmd.Process == nil {
-		return
-	}
-
-	_ = cmd.Cancel()
-	<-done
-}
-
-// ForwardSignal sends a signal to the process group.
-func (p *Process) ForwardSignal(sig os.Signal) {
+func (p *Process) markStopping() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	cmd := p.currentCmd
-
-	if cmd == nil || cmd.Process == nil {
-		return
+	if p.pid != 0 {
+		p.state.Store(StateStopping)
 	}
-
-	sysSignal, ok := sig.(syscall.Signal)
-	if !ok {
-		return
-	}
-
-	_ = syscall.Kill(-cmd.Process.Pid, sysSignal)
 }
-
-// buildEnv returns the environment for child processes.
-// It inherits the current environment and overlays any per-process env vars.
+func (p *Process) runCommandsBefore(ctx context.Context) error {
+	for i, pre := range p.cfg.CommandsBefore {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		dir := pre.WorkDir
+		if dir == "" {
+			dir = p.cfg.WorkDir
+		}
+		spec := p.spec(pre.Command, dir)
+		spec.OnStart = func(pid int) { p.mu.Lock(); p.pid = pid; p.mu.Unlock() }
+		spec.OnExit = func(time.Duration) { p.mu.Lock(); p.pid = 0; p.state.Store(StateStarting); p.mu.Unlock() }
+		spec.OnStop = p.markStopping
+		r := p.service.Run(ctx, spec)
+		if r.Err != nil {
+			var supervisor *execution.SupervisorError
+			if r.Cancelled || errors.As(r.Err, &supervisor) || !pre.ContinueOnError {
+				return fmt.Errorf("commandsBefore[%d]: %w", i, r.Err)
+			}
+			logging.Gonner("commandsBefore[%d] for %q failed (continuing): %v", i, p.Name(), r.Err)
+		}
+	}
+	return nil
+}
+func (p *Process) Stop() {
+	p.mu.Lock()
+	cancel := p.cancel
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		<-p.doneCh
+	}
+}
+func (p *Process) ForwardSignal(sig os.Signal) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s, ok := sig.(syscall.Signal)
+	if !ok {
+		return nil
+	}
+	return execution.SignalGroup(p.pid, s)
+}
 func (p *Process) buildEnv() []string {
 	env := []string{}
-	inherited := os.Environ()
-	if p.cfg.ClearEnv {
-		inherited = nil
-	}
-	for _, entry := range inherited {
-		if !strings.HasPrefix(entry, "GONNER_INSTANCE_ID=") && !strings.HasPrefix(entry, "GONNER_GENERATION=") {
-			env = append(env, entry)
+	if !p.cfg.ClearEnv {
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "GONNER_INSTANCE_ID=") && !strings.HasPrefix(entry, "GONNER_GENERATION=") {
+				env = append(env, entry)
+			}
 		}
 	}
 	for k, v := range p.cfg.Env {
@@ -574,49 +324,4 @@ func parseSignal(name string) syscall.Signal {
 	default:
 		return syscall.SIGTERM
 	}
-}
-
-// applyCredential sets cmd.SysProcAttr.Credential from a user/group name or UID/GID.
-// No-op if userSpec is empty. Returns an error if lookup fails or current process is not root.
-func applyCredential(cmd *exec.Cmd, userSpec, groupSpec string) error {
-	if userSpec == "" {
-		return nil
-	}
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("dropping privileges to %q requires running as root", userSpec)
-	}
-
-	var uid, gid uint64
-	u, err := user.Lookup(userSpec)
-	if err != nil {
-		// Try numeric UID
-		n, errN := strconv.ParseUint(userSpec, 10, 32)
-		if errN != nil {
-			return fmt.Errorf("looking up user %q: %w", userSpec, err)
-		}
-		uid = n
-		gid = n
-	} else {
-		uid, _ = strconv.ParseUint(u.Uid, 10, 32)
-		gid, _ = strconv.ParseUint(u.Gid, 10, 32)
-	}
-
-	if groupSpec != "" {
-		g, err := user.LookupGroup(groupSpec)
-		if err != nil {
-			n, errN := strconv.ParseUint(groupSpec, 10, 32)
-			if errN != nil {
-				return fmt.Errorf("looking up group %q: %w", groupSpec, err)
-			}
-			gid = n
-		} else {
-			gid, _ = strconv.ParseUint(g.Gid, 10, 32)
-		}
-	}
-
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid)}
-	return nil
 }

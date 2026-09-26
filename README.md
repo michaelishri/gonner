@@ -2,7 +2,7 @@
 
 A lightweight, PID-1-aware process manager for containers. Single static Go binary, no runtime dependencies. Designed to be a Docker `ENTRYPOINT` that orchestrates multiple long-running services, but works equally well for local development.
 
-[![Go Version](https://img.shields.io/badge/go-1.25%2B-blue)](go.mod)
+[![Go Version](https://img.shields.io/badge/go-1.26.7%2B-blue)](go.mod)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 ---
@@ -44,7 +44,7 @@ A lightweight, PID-1-aware process manager for containers. Single static Go bina
 Download a prebuilt binary from [Releases](https://github.com/michaelishri/gonner/releases), or build from source:
 
 ```bash
-# requires Go 1.25+
+# requires Go 1.26.7+
 go install github.com/michaelishri/gonner/cmd/gonner@latest
 ```
 

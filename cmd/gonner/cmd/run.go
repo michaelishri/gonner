@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/michaelishri/gonner/internal/health"
 	"github.com/michaelishri/gonner/internal/logging"
 	"github.com/michaelishri/gonner/internal/runner"
+	"github.com/michaelishri/gonner/internal/safefile"
 )
 
 var (
@@ -77,6 +80,8 @@ func runRun(_ *cobra.Command, _ []string) error {
 		defer stop()
 	}
 
+	var healthErr error
+	var healthDone chan struct{}
 	// Start health endpoint if configured
 	if port > 0 {
 		opts := health.Options{
@@ -96,21 +101,48 @@ func runRun(_ *cobra.Command, _ []string) error {
 		if err := healthSrv.Start(ctx); err != nil {
 			return fmt.Errorf("failed to start health endpoint: %w", err)
 		}
+		healthDone = make(chan struct{})
+		go func() {
+			defer close(healthDone)
+			healthErr = <-healthSrv.Errors()
+			if healthErr != nil {
+				cancel()
+			}
+		}()
+		defer func() { cancel(); <-healthSrv.Done(); <-healthDone }()
+
 	}
 
 	logging.Gonner("Gonner starting (PID %d)", os.Getpid())
 
-	// Write PID file if configured.
+	// PID files use the same descriptor-relative safety policy as logs.
 	if cfg.PIDFile != "" {
-		if err := os.WriteFile(cfg.PIDFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
-			logging.Gonner("warning: failed to write pidFile %s: %v", cfg.PIDFile, err)
-		} else {
-			defer os.Remove(cfg.PIDFile)
+		dir, err := safefile.OpenDirectory(filepath.Dir(cfg.PIDFile))
+		if err != nil {
+			return fmt.Errorf("pidFile: %w", err)
 		}
+		defer dir.Close()
+		name := filepath.Base(cfg.PIDFile)
+		f, err := dir.OpenRegular(name, os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			return fmt.Errorf("pidFile: %w", err)
+		}
+		writeErr := f.Truncate(0)
+		if writeErr == nil {
+			_, writeErr = fmt.Fprintf(f, "%d\n", os.Getpid())
+		}
+		closeErr := f.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			return fmt.Errorf("pidFile: %w", err)
+		}
+		defer dir.Remove(name)
 	}
-
-	// Run all processes (blocks until done)
-	if err := mgr.Run(ctx); err != nil {
+	err = mgr.Run(ctx)
+	cancel()
+	if healthDone != nil {
+		<-healthDone
+	}
+	if err = errors.Join(err, healthErr); err != nil {
 		return fmt.Errorf("manager exited with error: %w", err)
 	}
 

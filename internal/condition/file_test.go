@@ -1,6 +1,7 @@
 package condition
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +16,7 @@ func TestFileCondition_FileExists(t *testing.T) {
 
 	cond := NewFileCondition(f)
 
-	ok, err := cond.Evaluate()
+	ok, err := cond.Evaluate(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -27,7 +28,7 @@ func TestFileCondition_FileExists(t *testing.T) {
 func TestFileCondition_FileNotExists(t *testing.T) {
 	cond := NewFileCondition("/nonexistent/path/file.txt")
 
-	ok, err := cond.Evaluate()
+	ok, err := cond.Evaluate(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -40,7 +41,7 @@ func TestFileCondition_DirectoryExists(t *testing.T) {
 	dir := t.TempDir()
 	cond := NewFileCondition(dir)
 
-	ok, err := cond.Evaluate()
+	ok, err := cond.Evaluate(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

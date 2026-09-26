@@ -30,7 +30,7 @@ ENTRYPOINT ["gonner"]
 ### Multi-stage build
 
 ```dockerfile
-FROM golang:1.25-alpine AS build
+FROM golang:1.26.7-alpine AS build
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -ldflags '-s -w' -o /out/gonner ./cmd/gonner
@@ -111,7 +111,7 @@ spec:
         runAsNonRoot: false        # gonner needs root for the zombie reaper if PID 1
         capabilities:
           drop: ["ALL"]
-          add:  ["CHOWN", "SETUID", "SETGID"]  # if you use user/group privilege drop
+          add:  ["CHOWN", "SETUID", "SETGID", "KILL"]  # if you use user/group privilege drop
 ```
 
 Match `terminationGracePeriodSeconds` to (`shutdownTimeout` + buffer).

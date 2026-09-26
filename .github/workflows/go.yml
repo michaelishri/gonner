@@ -1,34 +1,48 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
 name: Go
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: 1.26.6
-
-      - name: Build
-        run: go build -v ./...
-
-      - name: Test
+          go-version-file: go.mod
+      - name: Verify source and modules
         run: |
           go mod download all
           go mod verify
           git diff --exit-code -- go.mod go.sum
           test -z "$(gofmt -l $(git ls-files '*.go'))"
-          go vet ./...
-          go test -race -timeout=180s ./...
-          go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+          go build ./...
+      - run: go vet ./...
+      - run: go test -race -count=1 -cover ./...
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: PID 1 and capability integration tests
+        if: runner.os == 'Linux'
+        run: |
+          docker pull alpine:3.21
+          GONNER_DOCKER_TESTS=1 go test -count=1 -timeout=10m ./internal/integration
+  vulnerabilities:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - run: govulncheck ./...
+      - name: Build and scan all release targets
+        run: bash scripts/check-artifacts.sh

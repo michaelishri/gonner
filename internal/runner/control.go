@@ -2,7 +2,6 @@ package runner
 
 import (
 	"errors"
-	"syscall"
 	"time"
 )
 
@@ -31,7 +30,7 @@ func (p *Process) requestedRestart() bool {
 }
 
 // restart atomically claims the current generation. Duplicate requests are
-// idempotent; a captured stop closure can only address this launch's group.
+// idempotent; the request channel belongs only to this launch's execution.
 func (p *Process) restart(expected string, grace time.Duration) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -41,13 +40,12 @@ func (p *Process) restart(expected string, grace time.Duration) error {
 	if p.restartRequested {
 		return nil
 	}
-	if p.State() != StateRunning || p.currentCmd == nil {
+	if p.State() != StateRunning || p.pid == 0 || p.generationStop == nil {
 		return ErrGeneration
 	}
 	p.restartRequested = true
 	p.state.Store(StateStopping)
-	stop := p.generationStop
-	go func() { _ = stop(grace) }()
+	p.generationStop <- grace
 	return nil
 }
 
@@ -73,17 +71,4 @@ func (m *Manager) Restart(id, expected string, grace time.Duration) error {
 		}
 	}
 	return ErrGeneration
-}
-
-func waitGroupGone(pgid int, budget time.Duration) bool {
-	deadline := time.Now().Add(budget)
-	for {
-		if errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		time.Sleep(time.Millisecond)
-	}
 }

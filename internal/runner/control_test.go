@@ -27,7 +27,7 @@ func awaitInstance(t *testing.T, mgr *Manager, check func(InstanceInfo) bool) In
 }
 
 func TestConditionalRestartDoesNotTouchReplacementOrSibling(t *testing.T) {
-	cfg := &config.Config{Mode: "parallel", ShutdownTimeout: config.Duration(100 * time.Millisecond), Run: []config.ProcessConfig{
+	cfg := &config.Config{Mode: "parallel", Control: &config.ControlConfig{Socket: "/unused-control-fixture.sock", RestartGrace: config.Duration(10 * time.Millisecond)}, ShutdownTimeout: config.Duration(100 * time.Millisecond), Run: []config.ProcessConfig{
 		{Name: "worker", Command: "exec sleep 60", Instances: 2, AutoRestart: true, Controllable: true,
 			Backoff: &config.BackoffConfig{InitialDelay: config.Duration(100 * time.Millisecond), MaxDelay: config.Duration(100 * time.Millisecond), Multiplier: 1}},
 	}}
@@ -84,8 +84,8 @@ func TestRestartOnSuccessAndBootstrapIdentity(t *testing.T) {
 	p := NewProcess(cfg, 0, 100*time.Millisecond, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := p.Run(ctx); err != nil {
-		t.Fatal(err)
+	if err := p.Run(ctx); err == nil || p.State() != StateFailed || p.Info().Restarts != 1 {
+		t.Fatalf("retry limit was not enforced: %v, %+v", err, p.Info())
 	}
 	data, err := os.ReadFile(file)
 	if err != nil {
