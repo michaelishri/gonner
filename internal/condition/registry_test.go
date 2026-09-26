@@ -1,6 +1,7 @@
 package condition
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -44,7 +45,7 @@ func TestEvaluateAll_AllTrue(t *testing.T) {
 		{"fileExists": f},
 	}
 
-	ok, _, err := EvaluateAll(conditions)
+	ok, _, err := EvaluateAll(context.Background(), conditions)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -61,7 +62,7 @@ func TestEvaluateAll_OneFalse(t *testing.T) {
 		{"fileExists": "/nonexistent/path"},
 	}
 
-	ok, reason, err := EvaluateAll(conditions)
+	ok, reason, err := EvaluateAll(context.Background(), conditions)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -74,7 +75,7 @@ func TestEvaluateAll_OneFalse(t *testing.T) {
 }
 
 func TestEvaluateAll_Empty(t *testing.T) {
-	ok, _, err := EvaluateAll(nil)
+	ok, _, err := EvaluateAll(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -92,7 +93,7 @@ func TestEvaluateAll_MultipleSameType(t *testing.T) {
 		{"env": "TEST_ALL_M2=b"},
 	}
 
-	ok, _, err := EvaluateAll(conditions)
+	ok, _, err := EvaluateAll(context.Background(), conditions)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -109,7 +110,7 @@ func TestEvaluateAny_OneTrue(t *testing.T) {
 		{"fileExists": os.TempDir()}, // exists
 	}
 
-	ok, _, err := EvaluateAny(conditions)
+	ok, _, err := EvaluateAny(context.Background(), conditions)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -126,7 +127,7 @@ func TestEvaluateAny_NoneTrue(t *testing.T) {
 		{"fileExists": "/nonexistent/path"},
 	}
 
-	ok, _, err := EvaluateAny(conditions)
+	ok, _, err := EvaluateAny(context.Background(), conditions)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -136,7 +137,7 @@ func TestEvaluateAny_NoneTrue(t *testing.T) {
 }
 
 func TestEvaluateAny_Empty(t *testing.T) {
-	ok, _, err := EvaluateAny(nil)
+	ok, _, err := EvaluateAny(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -149,7 +150,7 @@ func TestShouldRun_BothMet(t *testing.T) {
 	t.Setenv("TEST_SHOULD_A", "1")
 	dir := t.TempDir()
 
-	ok, _, err := ShouldRun(
+	ok, _, err := ShouldRun(context.Background(),
 		[]map[string]string{{"env": "TEST_SHOULD_A=1"}},
 		[]map[string]string{{"fileExists": dir}},
 	)
@@ -164,7 +165,7 @@ func TestShouldRun_BothMet(t *testing.T) {
 func TestShouldRun_WhenAllFails(t *testing.T) {
 	os.Unsetenv("TEST_SHOULD_MISSING")
 
-	ok, reason, err := ShouldRun(
+	ok, reason, err := ShouldRun(context.Background(),
 		[]map[string]string{{"env": "TEST_SHOULD_MISSING=yes"}},
 		nil,
 	)
@@ -180,7 +181,7 @@ func TestShouldRun_WhenAllFails(t *testing.T) {
 }
 
 func TestShouldRun_NilConditions(t *testing.T) {
-	ok, _, err := ShouldRun(nil, nil)
+	ok, _, err := ShouldRun(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -203,7 +204,7 @@ func TestRegister_Custom(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	ok, err := cond.Evaluate()
+	ok, err := cond.Evaluate(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -214,5 +215,24 @@ func TestRegister_Custom(t *testing.T) {
 
 type alwaysTrueCond struct{}
 
-func (c *alwaysTrueCond) Type() string            { return "alwaysTrue" }
-func (c *alwaysTrueCond) Evaluate() (bool, error) { return true, nil }
+func (c *alwaysTrueCond) Type() string                           { return "alwaysTrue" }
+func (c *alwaysTrueCond) Evaluate(context.Context) (bool, error) { return true, nil }
+
+func TestEvaluatorPreservesCustomCommandFactory(t *testing.T) {
+	registryMu.RLock()
+	original := registry["commandSucceeds"]
+	registryMu.RUnlock()
+	Register("commandSucceeds", func(string) Condition { return &alwaysTrueCond{} })
+	defer Register("commandSucceeds", original)
+	ok, _, err := ShouldRun(context.Background(), []map[string]string{{"commandSucceeds": "false"}}, nil)
+	if err != nil || !ok {
+		t.Fatalf("custom factory ignored: %v %v", ok, err)
+	}
+}
+func TestEmptyConditionsRespectCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := ShouldRun(ctx, nil, nil); err != context.Canceled {
+		t.Fatalf("cancelled evaluation: %v", err)
+	}
+}

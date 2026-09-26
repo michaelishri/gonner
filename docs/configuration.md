@@ -81,12 +81,12 @@ The health endpoint is **opt-in**. Set `health.port` to enable it.
 | `bindAddr` | string | `"0.0.0.0"` | Bind address. **Set to `"127.0.0.1"` for localhost-only.** |
 | `authToken` | string | — | If set, `/status` and `/metrics` require `Authorization: Bearer <token>`. `/health` is always public. May be overridden by `GONNER_HEALTH_TOKEN` env var (preferred for secrets). |
 | `metrics` | bool | `false` | Enable Prometheus-compatible `/metrics`. |
-| `tls` | object | — | TLS settings — `{ "certFile": "...", "keyFile": "..." }`. When set, the server speaks HTTPS with a minimum protocol version of TLS 1.2. |
+| `tls` | object | — | TLS settings — `{ "certFile": "...", "keyFile": "..." }`. Certificates are loaded before binding or starting workloads; invalid or mismatched keys abort startup. When set, the server speaks HTTPS with a minimum protocol version of TLS 1.2. |
 
 Endpoints:
 
 - `GET /health` — unauthenticated **liveness** probe; returns `200 {"status":"healthy"}` while running, `503 {"status":"shutting_down"}` during shutdown. Use as a Docker `HEALTHCHECK` or Kubernetes liveness probe.
-- `GET /ready` — unauthenticated **readiness** probe; returns `200 {"status":"ready"}` only when gonner is not shutting down **and** every `critical` process has a running instance, otherwise `503 {"status":"not_ready"}`. Use as a Kubernetes readiness probe. If no `critical` processes are defined, readiness tracks liveness.
+- `GET /ready` — unauthenticated **readiness** probe; returns `200 {"status":"ready"}` only when gonner is not shutting down **and** every `critical` process has a running instance, otherwise `503 {"status":"not_ready"}`. Use as a Kubernetes readiness probe. Pending and condition-skipped critical processes return 503 and remain visible in status and metrics with their configured instance count. If no `critical` processes are defined, readiness tracks liveness.
 - `GET /status` — full per-process detail (uptime, PID, restart count, etc.). Authenticated if `authToken` is set.
 - `GET /metrics` — Prometheus text format. Only if `metrics: true`. Authenticated if `authToken` is set.
 
@@ -102,17 +102,17 @@ Each entry defines a managed process.
 | `command` | string | required | Executed via `sh -c`. |
 | `workDir` | string | inherit | Working directory. |
 | `env` | object | — | Extra environment variables: `{ "KEY": "VALUE" }`. Merged on top of gonner's environment. |
-| `user` | string | — | Username or numeric UID to drop to before exec. **Requires gonner to start as root.** |
+| `user` | string | — | Username or numeric UID to drop to before exec. Uses the account's primary GID; unknown numeric UIDs require an explicit `group`. Requires root on macOS, or appropriate Linux capabilities. |
 | `group` | string | — | Group name or GID. Requires `user`. |
-| `logFile` | string | — | Path to append raw process output. Parents are created (`0o750`). |
+| `logFile` | string | — | Path to append raw process output. Parents are created (`0o750`) and must satisfy the [safe path policy](security.md#log-files). |
 | `logFileMode` | int | `0o600` | POSIX mode bits for the log file (e.g. `0o600`, `0o640`). |
 | `logRotate` | object | — | Size-based rotation. See [`logRotate`](#logrotate). |
-| `autoRestart` | bool | `false` | Restart on non-zero exit (and on zero exit too if true? — no: clean exit ends the lifecycle). |
-| `maxRetries` | int | `0` | Cap on restarts. `0` = unlimited (only applies if `autoRestart` is true). |
+| `autoRestart` | bool | `false` | Restart on non-zero exit or failed launch. Clean exit ends the lifecycle. |
+| `maxRetries` | int | `0` | Cap on extra launch attempts (failed launches also consume the budget). `0` = unlimited (only applies if `autoRestart` is true). |
 | `backoff` | object | defaults | See [`backoff`](#backoff). |
 | `instances` | int | `1` | Number of identical copies. Each instance has its own PID, log prefix, and restart counter. |
-| `critical` | bool | `false` | Unexpected exit triggers full shutdown of the entire gonner process tree. |
-| `dependsOn` | []string | `[]` | Process names that must be Running before this one starts. |
+| `critical` | bool | `false` | Failed launch, non-zero exit or failed required precommand triggers full shutdown and exit 1. |
+| `dependsOn` | []string | `[]` | Process names for which any instance must have started successfully at least once. |
 | `whenAll` | array | — | See [Conditions](#conditions-whenall--whenany). |
 | `whenAny` | array | — | See [Conditions](#conditions-whenall--whenany). |
 | `commandsBefore` | array | `[]` | Pre-start commands. See [`commandsBefore`](#commandsbefore). |
@@ -125,7 +125,7 @@ A process moves through: `pending → starting → running → stopping → stop
 
 ### Multi-instance processes
 
-When `instances > 1`, gonner spawns N goroutines, each with its own PID and restart counter. Log prefixes are suffixed with `/INDEX` (e.g. `[queue/3]`). A process is considered "running" for `dependsOn` resolution as soon as **any one** instance reaches `running`.
+When `instances > 1`, gonner spawns N goroutines, each with its own PID and restart counter. Log prefixes are suffixed with `/INDEX` (e.g. `[queue/3]`). A dependency is satisfied permanently as soon as **any one** instance starts successfully, including a short-lived prerequisite. This is an initial-start gate, not ongoing availability monitoring. If every instance finishes without starting, waiting dependants become `skipped`; a critical dependant instead fails and stops the manager. Sequential mode uses the same any-instance gate, follows config order, and rejects forward `dependsOn` references.
 
 ---
 
@@ -139,7 +139,7 @@ Exponential backoff applied between restart attempts.
 | `maxDelay` | duration | `"30s"` | Cap on the delay. |
 | `multiplier` | float | `2.0` | Applied after each restart. |
 
-Jitter of ±10% is added to each delay to avoid thundering herds. The counter resets after the process has stayed running for longer than `maxDelay`.
+Jitter of ±10% is added to each delay to avoid thundering herds. The counter resets when a process exits after actually running longer than `maxDelay`; restart waits and output draining do not count. During backoff the process is `starting`, with no PID or running instance. Public `restarts` counts successful launches after the initial successful launch.
 
 ---
 
@@ -153,7 +153,7 @@ Sequentially executed pre-start commands. Their stdout/stderr stream to the same
 | `workDir` | string | parent's `workDir` | Working directory. |
 | `continueOnError` | bool | `false` | If `false`, a non-zero exit marks the process `failed` and the main command never starts. If `true`, a warning is logged and gonner continues. |
 
-`commandsBefore` inherits the parent process's `env`, `user`, and `group`.
+`commandsBefore` inherits the parent process's `env`, `user`, and `group`. A required precommand failure on a critical process triggers full shutdown. `continueOnError: true` keeps its existing meaning.
 
 ---
 
@@ -167,7 +167,7 @@ Size-based log rotation. Applies only when `logFile` is set.
 | `maxBackups` | int | `0` (unlimited) | Max number of rotated files to retain. |
 | `compress` | bool | `false` | Gzip rotated files. |
 
-Rotated files are named `<logFile>.<UTC-timestamp>` (e.g. `app.log.20260310T120000Z`); compressed files get a `.gz` suffix. Backup pruning keeps the most recent `maxBackups` files lexicographically.
+Rotated files use the reserved format `<logFile>.gonner-YYYYMMDDTHHMMSS.nnnnnnnnnZ-<32 lowercase hex digits>.log`, optionally suffixed `.gz`. Names include nanoseconds and randomness and are published exclusively. Pruning only touches regular backups in this format, excluding configured active log paths. Legacy backups and other prefixed files remain untouched. Processes sharing a canonical log path share one sink and must specify identical mode and rotation settings.
 
 For long-term storage and search, consider shipping logs to your centralized logging stack instead of relying on rotation alone.
 
@@ -175,7 +175,7 @@ For long-term storage and search, consider shipping logs to your centralized log
 
 ## Conditions: `whenAll` / `whenAny`
 
-Conditions decide whether a process starts. They evaluate **once**, at startup (after env interpolation).
+Conditions decide whether a process starts. They evaluate **once**, at startup, after configuration, credential and log-path preflight. Command conditions inherit their process's environment, working directory and credentials. All conditions receive the manager context; command probes have a 10s timeout and their whole process group is cleaned up on exit, timeout or cancellation.
 
 - `whenAll`: every condition must be true.
 - `whenAny`: at least one condition must be true.
@@ -214,7 +214,7 @@ typos are caught before deployment.
 
 ### Adding custom conditions
 
-Custom condition types can be registered programmatically (`condition.Register(name, factory)`) when embedding gonner as a library.
+Custom condition types can be registered programmatically (`condition.Register(name, factory)`) when embedding gonner as a library. Implement `Evaluate(context.Context) (bool, error)` and respect cancellation. Evaluation helpers also take the context as their first argument.
 
 ---
 
@@ -245,7 +245,7 @@ Queries a running gonner instance's `/status` endpoint and prints a formatted ta
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | `127.0.0.1` | Host to query. |
-| `--port`, `-p` | `8089` | Port to query (overridden by `GONNER_HEALTH_PORT`). |
+| `--port`, `-p` | `8089` | Port to query. An explicitly supplied flag always overrides `GONNER_HEALTH_PORT`, including `--port 8089`. |
 | `--token`, `-t` | from `GONNER_HEALTH_TOKEN` | Bearer token for authenticated endpoints. |
 | `--tls` | `false` | Query over HTTPS instead of HTTP. |
 | `--insecure` | `false` | Skip TLS certificate verification (use with `--tls` for self-signed certs). |
@@ -274,3 +274,7 @@ Prints version, commit hash, build date, and Go version.
 | `XDG_CONFIG_HOME` | Affects discovery priority 3. |
 
 Order of precedence for these settings: **CLI flag > environment variable > config file > built-in default**.
+
+## Exit status
+
+Gonner returns 1 for permanent process failures, exhausted retries, unavailable dependencies, and supervisor failures. A noncritical failure lets unrelated work continue and contributes to the eventual failure exit; a critical failure cancels all work. An intentional false condition alone is not a failure, including on a critical process, but leaves that critical process unready. Successful one-shot completion and operator shutdown return 0 unless a permanent failure was already recorded.

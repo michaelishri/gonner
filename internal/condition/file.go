@@ -1,6 +1,9 @@
 package condition
 
-import "os"
+import (
+	"context"
+	"os"
+)
 
 // FileCondition checks whether a file or directory exists at a given path.
 type FileCondition struct {
@@ -18,7 +21,10 @@ func (c *FileCondition) Type() string {
 }
 
 // Evaluate returns true if the path exists.
-func (c *FileCondition) Evaluate() (bool, error) {
+func (c *FileCondition) Evaluate(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	_, err := os.Stat(c.path)
 	if err == nil {
 		return true, nil

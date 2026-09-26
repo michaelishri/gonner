@@ -2,159 +2,234 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"github.com/michaelishri/gonner/internal/condition"
 	"github.com/michaelishri/gonner/internal/config"
+	"github.com/michaelishri/gonner/internal/execution"
 	"github.com/michaelishri/gonner/internal/logging"
 )
 
-// Manager orchestrates all managed processes.
 type Manager struct {
 	cfg          *config.Config
 	processes    []*Process
 	mu           sync.RWMutex
 	startedAt    time.Time
-	cancelFn     context.CancelFunc
 	shuttingDown atomic.Bool
+	service      *execution.Service
 }
 
-// NewManager creates a new process manager from a validated config.
 func NewManager(cfg *config.Config) *Manager {
-	return &Manager{
-		cfg: cfg,
+	copyCfg := *cfg
+	copyCfg.Run = append([]config.ProcessConfig(nil), cfg.Run...)
+	copyCfg.ApplyDefaults()
+	m := &Manager{cfg: &copyCfg, service: execution.NewService()}
+	m.service.Diagnostic = logging.Gonner
+	for _, c := range m.cfg.Run {
+		for i := 0; i < c.Instances; i++ {
+			p := NewProcess(c, i, time.Duration(m.cfg.ShutdownTimeout), nil)
+			p.service = m.service
+			m.processes = append(m.processes, p)
+		}
 	}
+	return m
 }
 
-// Run starts all processes and blocks until all have exited or the context is cancelled.
-func (m *Manager) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	m.cancelFn = cancel
+// waitStarted succeeds if ANY instance has ever started. It becomes unavailable
+// only when ALL instances terminate before starting; it never polls live state.
+func waitStarted(ctx context.Context, procs []*Process) bool {
+	cases := []reflect.SelectCase{{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())}}
+	for _, p := range procs {
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(p.Ready())}, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(p.Done())})
+	}
+	remaining := len(procs)
+	for remaining > 0 {
+		// Prefer already-successful starts even when Done is also closed.
+		for _, p := range procs {
+			select {
+			case <-p.Ready():
+				return true
+			default:
+			}
+		}
+		chosen, _, _ := reflect.Select(cases)
+		if chosen == 0 {
+			return false
+		}
+		if chosen%2 == 1 {
+			return true
+		}
+		cases[chosen].Chan = reflect.Value{}
+		remaining--
+	}
+	for _, p := range procs {
+		select {
+		case <-p.Ready():
+			return true
+		default:
+		}
+	}
+	return false
+}
+func (m *Manager) Run(parent context.Context) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	m.mu.Lock()
+	m.startedAt = time.Now()
+	m.mu.Unlock()
 	defer func() {
 		m.shuttingDown.Store(true)
-		cancel()
+		for _, p := range m.processes {
+			select {
+			case <-p.Done():
+			default:
+				p.finish(StateStopped)
+			}
+			if p.logWriter != nil {
+				_ = p.logWriter.Close()
+			}
+		}
 	}()
-
-	m.startedAt = time.Now()
-	shutdownTimeout := time.Duration(m.cfg.ShutdownTimeout)
-
-	// Start zombie reaper (no-op if not PID 1)
-	reaperDone := make(chan struct{})
-	StartZombieReaper(reaperDone)
-	defer close(reaperDone)
-
-	// Evaluate conditions and filter runnable processes
-	var runnableConfigs []config.ProcessConfig
-	for _, procCfg := range m.cfg.Run {
-		shouldRun, reason, err := condition.ShouldRun(procCfg.WhenAll, procCfg.WhenAny)
+	if err := config.Validate(m.cfg); err != nil {
+		return err
+	}
+	// All paths and credentials are checked before even command conditions.
+	for _, p := range m.processes {
+		if err := p.prepare(); err != nil {
+			p.finish(StateFailed)
+			return fmt.Errorf("preflight %q: %w", p.Name(), err)
+		}
+	}
+	// Keep the orphan reaper alive through cancellation and child cleanup.
+	joinReaper, err := m.service.StartReaper(context.Background())
+	if err != nil {
+		return err
+	}
+	defer joinReaper()
+	var errorsMu sync.Mutex
+	var failures []error
+	record := func(err error) {
 		if err != nil {
-			return fmt.Errorf("evaluating conditions for %q: %w", procCfg.Name, err)
-		}
-		if !shouldRun {
-			logging.Gonner("Skipping %q: condition not met (%s)", procCfg.Name, reason)
-			continue
-		}
-		runnableConfigs = append(runnableConfigs, procCfg)
-	}
-
-	if len(runnableConfigs) == 0 {
-		logging.Gonner("No processes to run after condition evaluation")
-		return nil
-	}
-
-	// Build process instances
-	// readyMap tracks which process name -> ready channels for dependsOn resolution
-	readyMap := make(map[string][]*Process)
-
-	for _, procCfg := range runnableConfigs {
-		for i := 0; i < procCfg.Instances; i++ {
-			proc := NewProcess(procCfg, i, shutdownTimeout, cancel)
-			m.mu.Lock()
-			m.processes = append(m.processes, proc)
-			m.mu.Unlock()
-			readyMap[procCfg.Name] = append(readyMap[procCfg.Name], proc)
+			errorsMu.Lock()
+			failures = append(failures, err)
+			errorsMu.Unlock()
 		}
 	}
-
-	logging.Gonner("Starting %d process(es) in %s mode", len(m.processes), m.cfg.Mode)
-
-	g, gCtx := errgroup.WithContext(ctx)
-	stopShutdownWatch := context.AfterFunc(gCtx, func() {
-		m.shuttingDown.Store(true)
-	})
-	defer stopShutdownWatch()
-
+	watchDone := make(chan struct{})
+	watchExit := make(chan struct{})
+	go func() {
+		defer close(watchExit)
+		select {
+		case err := <-m.service.Errors:
+			record(err)
+			cancel()
+		case <-watchDone:
+		}
+	}()
+	var stopMonitorOnce sync.Once
+	stopMonitor := func() { stopMonitorOnce.Do(func() { close(watchDone); <-watchExit }) }
+	defer stopMonitor()
+	shutdownWatch := context.AfterFunc(ctx, func() { m.shuttingDown.Store(true) })
+	defer shutdownWatch()
+	groups := make(map[string][]*Process)
+	for _, p := range m.processes {
+		groups[p.cfg.Name] = append(groups[p.cfg.Name], p)
+		p.onCriticalExit = cancel
+	}
+	for _, c := range m.cfg.Run {
+		if ctx.Err() != nil {
+			break
+		}
+		p := groups[c.Name][0]
+		spec := p.spec("", c.WorkDir)
+		spec.Output = nil
+		ok, reason, err := condition.NewEvaluator(m.service, spec).ShouldRun(ctx, c.WhenAll, c.WhenAny)
+		if err != nil {
+			if ctx.Err() == nil {
+				record(fmt.Errorf("conditions for %q: %w", c.Name, err))
+			}
+			cancel()
+			break
+		}
+		if !ok {
+			logging.Gonner("Skipping %q: %s", c.Name, reason)
+			for _, p := range groups[c.Name] {
+				p.finish(StateSkipped)
+			}
+		}
+	}
+	var wg sync.WaitGroup
+	launch := func(p *Process) {
+		select {
+		case <-p.Done():
+			return
+		default:
+		}
+		wg.Go(func() {
+			for _, dep := range p.cfg.DependsOn {
+				if !waitStarted(ctx, groups[dep]) {
+					if ctx.Err() != nil {
+						p.finish(StateStopped)
+						return
+					}
+					err := fmt.Errorf("process %q: dependency %q never started", p.Name(), dep)
+					if p.cfg.Critical {
+						p.finish(StateFailed)
+						record(err)
+						cancel()
+					} else {
+						p.finish(StateSkipped)
+						record(err)
+					}
+					return
+				}
+			}
+			if ctx.Err() != nil {
+				p.finish(StateStopped)
+				return
+			}
+			err := p.Run(ctx)
+			record(err)
+			var supervisor *execution.SupervisorError
+			if errors.As(err, &supervisor) {
+				cancel()
+			}
+		})
+	}
 	if m.cfg.Mode == "sequential" {
-		// Sequential: start each process config one at a time
-	startup:
-		for _, procCfg := range runnableConfigs {
-			if gCtx.Err() != nil {
+		for _, c := range m.cfg.Run {
+			if ctx.Err() != nil {
 				break
 			}
-			procCfg := procCfg // capture for closure
-			procs := readyMap[procCfg.Name]
-
-			// Start all instances of this process
-			for _, proc := range procs {
-				proc := proc
-				g.Go(func() error {
-					defer logging.Recover(fmt.Sprintf("runner[%s]", proc.Name()))
-					return proc.Run(gCtx)
-				})
+			for _, p := range groups[c.Name] {
+				launch(p)
 			}
-
-			// Wait for at least one instance to be ready (or exit) before moving to next
-			if len(procs) > 0 {
-				select {
-				case <-procs[0].Ready():
-				case <-procs[0].Done():
-					// Process exited before becoming ready; continue to next
-				case <-gCtx.Done():
-					// Already-started processes still need to finish shutdown.
-					break startup
-				}
-			}
+			_ = waitStarted(ctx, groups[c.Name])
 		}
 	} else {
-		// Parallel: start all processes with dependsOn coordination
-		for _, proc := range m.processes {
-			proc := proc
-			g.Go(func() error {
-				defer logging.Recover(fmt.Sprintf("runner[%s]", proc.Name()))
-				// Wait for dependencies
-				for _, depName := range proc.cfg.DependsOn {
-					depProcs, ok := readyMap[depName]
-					if !ok {
-						// Dependency was skipped by conditions — treat as unavailable
-						logging.Gonner("Dependency %q for %q was skipped — skipping %q", depName, proc.Name(), proc.Name())
-						proc.state.Store(StateSkipped)
-						return nil
-					}
-					// Wait for at least one instance of the dependency to be ready
-					select {
-					case <-depProcs[0].Ready():
-					case <-gCtx.Done():
-						return nil
-					}
-				}
-				return proc.Run(gCtx)
-			})
+		for _, p := range m.processes {
+			launch(p)
 		}
 	}
-
-	// Each command handles cancellation using its configured stop signal and
-	// timeout. Join all lifecycles before returning, including during startup.
-	err := g.Wait()
-	m.shuttingDown.Store(true)
-
-	logging.Gonner("All processes have exited")
-	return err
+	wg.Wait()
+	joinReaper()
+	stopMonitor()
+	// Join the error monitor before reading failures, without closing its channel
+	// twice. Drain any final infrastructure error before producing exit status.
+	select {
+	case err := <-m.service.Errors:
+		record(err)
+	default:
+	}
+	errorsMu.Lock()
+	defer errorsMu.Unlock()
+	return errors.Join(failures...)
 }
 
 // Processes returns info about all managed processes.
@@ -228,6 +303,11 @@ func (m *Manager) Processes() []ProcessInfo {
 
 // Uptime returns how long the manager has been running.
 func (m *Manager) Uptime() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.startedAt.IsZero() {
+		return 0
+	}
 	return time.Since(m.startedAt)
 }
 
@@ -277,14 +357,11 @@ func (m *Manager) Ready() bool {
 	return true
 }
 
-// ForwardSignal sends a signal to all running processes.
+// ForwardSignal forwards operational signals and reports failures to Run.
 func (m *Manager) ForwardSignal(sig os.Signal) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	for _, proc := range m.processes {
-		if proc.State() == StateRunning {
-			proc.ForwardSignal(sig)
+	for _, p := range m.processes {
+		if err := p.ForwardSignal(sig); err != nil {
+			m.service.ReportSignalError(err)
 		}
 	}
 }

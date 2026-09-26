@@ -1,247 +1,300 @@
-// Package logging provides multiplexed log writers for gonner processes.
+// Package logging multiplexes bounded output chunks to console and shared files.
 package logging
 
 import (
 	"bufio"
 	"compress/gzip"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/michaelishri/gonner/internal/safefile"
 )
 
-// RotateOptions configures size-based log rotation.
 type RotateOptions struct {
-	MaxSizeMB  int  // rotate when file exceeds this size (0 = disabled)
-	MaxBackups int  // number of rotated files to retain (0 = unlimited)
-	Compress   bool // gzip rotated files
+	MaxSizeMB, MaxBackups int
+	Compress              bool
 }
-
-// Options configures a Writer.
 type Options struct {
-	ProcessName string
-	LogFilePath string
-	LogFileMode os.FileMode // default 0o600 if 0
-	Rotate      *RotateOptions
+	ProcessName, LogFilePath string
+	LogFileMode              os.FileMode
+	Rotate                   *RotateOptions
 }
-
-// Writer is a multiplexed writer that writes process output to both
-// gonner's stdout (with prefix) and an optional log file (raw).
 type Writer struct {
 	processName string
 	stdout      io.Writer
-	logFile     *os.File
-	logFilePath string
-	logFileMode os.FileMode
-	rotate      *RotateOptions
-	written     int64
+	sink        *fileSink
 	mu          sync.Mutex
+	closed      bool
+	lastError   time.Time
+}
+type fileSink struct {
+	mu        sync.Mutex
+	dir       *safefile.Directory
+	name, key string
+	file      *os.File
+	mode      os.FileMode
+	rotate    RotateOptions
+	written   int64
+	refs      int
 }
 
-// NewWriter creates a multiplexed writer with default settings.
-// Kept for backwards compatibility; for new code, use NewWriterWithOptions.
-func NewWriter(processName, logFilePath string) (*Writer, error) {
-	return NewWriterWithOptions(Options{
-		ProcessName: processName,
-		LogFilePath: logFilePath,
-	})
-}
+var sinks = struct {
+	sync.Mutex
+	files map[string]*fileSink
+}{files: make(map[string]*fileSink)}
+var activePaths sync.Map
+var consoleMu sync.Mutex
 
-// NewWriterWithOptions creates a multiplexed writer using the provided options.
+func NewWriter(name, path string) (*Writer, error) {
+	return NewWriterWithOptions(Options{ProcessName: name, LogFilePath: path})
+}
 func NewWriterWithOptions(opts Options) (*Writer, error) {
+	w := &Writer{processName: opts.ProcessName, stdout: os.Stdout}
+	if opts.LogFilePath == "" {
+		return w, nil
+	}
 	mode := opts.LogFileMode
 	if mode == 0 {
-		mode = 0o600
+		mode = 0600
 	}
-	w := &Writer{
-		processName: opts.ProcessName,
-		stdout:      os.Stdout,
-		logFilePath: opts.LogFilePath,
-		logFileMode: mode,
-		rotate:      opts.Rotate,
+	dir, err := safefile.OpenDirectory(filepath.Dir(opts.LogFilePath))
+	if err != nil {
+		return nil, fmt.Errorf("log directory: %w", err)
 	}
-
-	if opts.LogFilePath != "" {
-		if err := w.openLogFile(); err != nil {
-			return nil, err
+	name := filepath.Base(opts.LogFilePath)
+	key := dir.Key + "/" + name
+	rotate := RotateOptions{}
+	if opts.Rotate != nil {
+		rotate = *opts.Rotate
+	}
+	sinks.Lock()
+	defer sinks.Unlock()
+	if s := sinks.files[key]; s != nil {
+		_ = dir.Close()
+		if s.mode != mode || s.rotate != rotate {
+			return nil, fmt.Errorf("conflicting log settings for %s", opts.LogFilePath)
 		}
+		s.refs++
+		w.sink = s
+		return w, nil
 	}
-
+	f, err := dir.OpenRegular(name, os.O_WRONLY|os.O_CREATE|os.O_APPEND, mode)
+	if err != nil {
+		_ = dir.Close()
+		return nil, fmt.Errorf("opening log: %w", err)
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		_ = dir.Close()
+		return nil, err
+	}
+	s := &fileSink{dir: dir, name: name, key: key, file: f, mode: mode, rotate: rotate, written: st.Size(), refs: 1}
+	sinks.files[key] = s
+	activePaths.Store(key, true)
+	w.sink = s
 	return w, nil
 }
 
-func (w *Writer) openLogFile() error {
-	dir := filepath.Dir(w.logFilePath)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return fmt.Errorf("creating log directory %s: %w", dir, err)
-	}
-
-	f, err := os.OpenFile(w.logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, w.logFileMode)
-	if err != nil {
-		return fmt.Errorf("opening log file %s: %w", w.logFilePath, err)
-	}
-
-	// Enforce permissions even if the file existed.
-	if err := os.Chmod(w.logFilePath, w.logFileMode); err != nil {
-		Gonner("warning: chmod %s: %v", w.logFilePath, err)
-	}
-
-	w.logFile = f
-
-	if info, err := f.Stat(); err == nil {
-		w.written = info.Size()
-	}
-
-	return nil
-}
-
-// Write implements io.Writer. Each write is prefixed with timestamp and process name
-// on stdout, and written raw to the log file. Performs rotation if configured.
-func (w *Writer) Write(p []byte) (n int, err error) {
+// Write always attempts both destinations. A file error never stops console
+// output or future file retries. Callers must keep draining after write errors.
+func (w *Writer) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	if w.logFile != nil {
-		if err := w.maybeRotate(len(p)); err != nil {
-			Gonner("warning: log rotation failed for %s: %v", w.processName, err)
-		}
-		if _, werr := w.logFile.Write(p); werr != nil {
-			return 0, fmt.Errorf("writing to log file: %w", werr)
-		}
-		w.written += int64(len(p))
+	if w.closed {
+		return 0, os.ErrClosed
 	}
-
-	ts := time.Now().UTC().Format(time.RFC3339)
-	prefix := fmt.Sprintf("[%s] [%s] ", ts, w.processName)
-	if _, err := fmt.Fprintf(w.stdout, "%s%s", prefix, p); err != nil {
-		return 0, fmt.Errorf("writing to stdout: %w", err)
+	var fileErr error
+	if w.sink != nil {
+		fileErr = w.sink.write(p)
 	}
-
-	return len(p), nil
-}
-
-// maybeRotate rotates the active log file if it would exceed the configured size.
-// Called with the lock held.
-func (w *Writer) maybeRotate(incoming int) error {
-	if w.rotate == nil || w.rotate.MaxSizeMB <= 0 || w.logFile == nil {
-		return nil
+	consoleMu.Lock()
+	_, consoleErr := fmt.Fprintf(w.stdout, "[%s] [%s] %s", time.Now().UTC().Format(time.RFC3339), w.processName, p)
+	// Continuation chunks and unterminated final lines get a console newline;
+	// raw files receive exactly p, including its original lack of a newline.
+	if len(p) > 0 && p[len(p)-1] != '\n' {
+		_, err := fmt.Fprintln(w.stdout)
+		consoleErr = errors.Join(consoleErr, err)
 	}
-	limit := int64(w.rotate.MaxSizeMB) * 1024 * 1024
-	if w.written+int64(incoming) <= limit {
-		return nil
-	}
-
-	if err := w.logFile.Close(); err != nil {
-		return err
-	}
-
-	ts := time.Now().UTC().Format("20060102T150405Z")
-	rotated := w.logFilePath + "." + ts
-	if err := os.Rename(w.logFilePath, rotated); err != nil {
-		return err
-	}
-
-	if w.rotate.Compress {
-		if err := gzipFile(rotated); err != nil {
-			Gonner("warning: gzip %s: %v", rotated, err)
-		} else {
-			_ = os.Remove(rotated)
-		}
-	}
-
-	if w.rotate.MaxBackups > 0 {
-		w.pruneBackups()
-	}
-
-	w.written = 0
-	return w.openLogFile()
-}
-
-func (w *Writer) pruneBackups() {
-	dir := filepath.Dir(w.logFilePath)
-	base := filepath.Base(w.logFilePath)
-	entries, err := os.ReadDir(dir)
+	consoleMu.Unlock()
+	err := errors.Join(fileErr, consoleErr)
+	now := time.Now()
 	if err != nil {
-		return
-	}
-	var matches []string
-	for _, e := range entries {
-		name := e.Name()
-		if name == base {
-			continue
+		if w.lastError.IsZero() || now.Sub(w.lastError) >= time.Minute {
+			Gonner("Output error for %q (continuing to drain): %v", w.processName, err)
+			w.lastError = now
 		}
-		if strings.HasPrefix(name, base+".") {
-			matches = append(matches, filepath.Join(dir, name))
-		}
+	} else if !w.lastError.IsZero() {
+		Gonner("Output recovered for %q", w.processName)
+		w.lastError = time.Time{}
 	}
-	sort.Strings(matches)
-	if len(matches) <= w.rotate.MaxBackups {
-		return
-	}
-	excess := matches[:len(matches)-w.rotate.MaxBackups]
-	for _, p := range excess {
-		_ = os.Remove(p)
-	}
+	return len(p), err
 }
-
-func gzipFile(path string) error {
-	in, err := os.Open(path)
+func (s *fileSink) write(p []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var rotationErr error
+	if s.rotate.MaxSizeMB > 0 && s.written > 0 && s.written+int64(len(p)) > int64(s.rotate.MaxSizeMB)*1024*1024 {
+		rotationErr = s.rotateFile()
+	}
+	n, err := s.file.Write(p)
+	s.written += int64(n)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	return errors.Join(rotationErr, err)
+}
+func (s *fileSink) rotateFile() error {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
+	}
+	backup := fmt.Sprintf("%s.gonner-%s-%x.log", s.name, time.Now().UTC().Format("20060102T150405.000000000Z"), nonce)
+	// Link reserves the backup exclusively. Retain the original fd until its
+	// replacement is fully opened, and roll back if opening fails.
+	if err := s.dir.Link(s.name, backup); err != nil {
+		return err
+	}
+	if err := s.dir.Remove(s.name); err != nil {
+		_ = s.dir.Remove(backup)
+		return err
+	}
+	next, err := s.dir.OpenRegular(s.name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|os.O_APPEND, s.mode)
+	if err != nil {
+		if restoreErr := s.dir.Link(backup, s.name); restoreErr == nil {
+			_ = s.dir.Remove(backup)
+		}
+		return err
+	}
+	old := s.file
+	s.file = next
+	s.written = 0
+	closeErr := old.Close()
+	if s.rotate.Compress {
+		if err := s.compress(backup); err != nil {
+			return errors.Join(closeErr, err)
+		}
+	}
+	return errors.Join(closeErr, s.pruneBackups())
+}
+func (s *fileSink) compress(name string) error {
+	in, err := s.dir.OpenRegular(name, os.O_RDONLY, s.mode)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-
-	out, err := os.OpenFile(path+".gz", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	temp := name + ".gz.tmp"
+	out, err := s.dir.OpenRegular(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, s.mode)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
-
+	defer s.dir.Remove(temp)
 	gz := gzip.NewWriter(out)
-	if _, err := io.Copy(gz, in); err != nil {
-		_ = gz.Close()
+	_, copyErr := io.Copy(gz, in)
+	gzipErr := gz.Close()
+	closeErr := out.Close()
+	if err = errors.Join(copyErr, gzipErr, closeErr); err != nil {
 		return err
 	}
-	return gz.Close()
-}
-
-// Close closes the underlying log file if one was opened.
-func (w *Writer) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.logFile != nil {
-		err := w.logFile.Close()
-		w.logFile = nil
+	if err = s.dir.Link(temp, name+".gz"); err != nil {
 		return err
+	}
+	if err = s.dir.Remove(temp); err != nil {
+		return err
+	}
+	return s.dir.Remove(name)
+}
+func (s *fileSink) pruneBackups() error {
+	if s.rotate.MaxBackups <= 0 {
+		return nil
+	}
+	entries, err := s.dir.Entries()
+	if err != nil {
+		return err
+	}
+	pattern := regexp.MustCompile("^" + regexp.QuoteMeta(s.name) + `\.gonner-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[0-9a-f]{32}\.log(\.gz)?$`)
+	var backups []string
+	for _, entry := range entries {
+		n := entry.Name()
+		if !pattern.MatchString(n) || !entry.Type().IsRegular() {
+			continue
+		}
+		if _, active := activePaths.Load(s.dir.Key + "/" + n); active {
+			continue
+		}
+		// Descriptor-relative validation excludes links, devices and untrusted files.
+		f, e := s.dir.OpenRegular(n, os.O_RDONLY, s.mode)
+		if e != nil {
+			continue
+		}
+		_ = f.Close()
+		backups = append(backups, n)
+	}
+	sort.Strings(backups)
+	for len(backups) > s.rotate.MaxBackups {
+		if err := s.dir.Remove(backups[0]); err != nil {
+			return err
+		}
+		backups = backups[1:]
 	}
 	return nil
 }
+func (w *Writer) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+	if w.sink == nil {
+		return nil
+	}
+	s := w.sink
+	sinks.Lock()
+	defer sinks.Unlock()
+	s.refs--
+	if s.refs > 0 {
+		return nil
+	}
+	delete(sinks.files, s.key)
+	activePaths.Delete(s.key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return errors.Join(s.file.Close(), s.dir.Close())
+}
 
-// LineScanner reads from a reader line-by-line and writes each line to the writer.
-// This ensures log prefixes are applied cleanly per line rather than mid-line.
-// It blocks until the reader is exhausted or an error occurs.
-func LineScanner(r io.Reader, w *Writer) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		_, _ = w.Write([]byte(line + "\n"))
+// LineScanner preserves all bytes, using at most 64 KiB for each stream chunk.
+// ReadSlice returns oversized lines in fragments instead of stopping the drain.
+// Destination failures are reported by Writer; only read errors end a stream.
+func LineScanner(r io.Reader, w *Writer) error {
+	reader := bufio.NewReaderSize(r, 64*1024)
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(part) > 0 {
+			_, _ = w.Write(part)
+		}
+		if err == nil || errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
 	}
 }
-
-// Gonner writes gonner's own operational messages to stderr.
-func Gonner(format string, args ...interface{}) {
-	ts := time.Now().UTC().Format(time.RFC3339)
+func Gonner(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(os.Stderr, "[%s] [gonner] %s\n", ts, msg)
+	fmt.Fprintf(os.Stderr, "[%s] [gonner] %s\n", time.Now().UTC().Format(time.RFC3339), strings.TrimSuffix(msg, "\n"))
 }
-
-// Recover is a panic recovery helper for long-running goroutines.
-// Use as: defer logging.Recover("name").
 func Recover(name string) {
 	if r := recover(); r != nil {
 		Gonner("PANIC in %s: %v", name, r)

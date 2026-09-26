@@ -206,7 +206,7 @@ func TestRunShutdown(t *testing.T) {
 				t.Fatal("supervisor did not finish shutdown")
 			}
 			elapsed := time.Since(start)
-			if waitErr != nil {
+			if (waitErr != nil) != tc.critical {
 				t.Errorf("supervisor exit: %v\n%s", waitErr, &output)
 			}
 			stopped, err := os.ReadFile(filepath.Join(dir, "stopped"))
@@ -301,4 +301,30 @@ func TestShutdownHelper(t *testing.T) {
 		os.Exit(2)
 	}
 	os.Exit(0)
+}
+
+func TestInvalidTLSPreventsWorkloadStartup(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "should-not-run")
+	cfg := map[string]any{"health": map[string]any{"port": 8089, "tls": map[string]string{"certFile": "/gonner-missing-cert", "keyFile": "/gonner-missing-key"}}, "run": []map[string]any{{"name": "worker", "command": "touch " + shellQuote(marker)}}}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gonner.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(executable, "-test.run=^TestShutdownHelper$", "--", "gonner")
+	command.Env = append(os.Environ(), "GONNER_SHUTDOWN_HELPER=1", "GONNER_SHUTDOWN_DIR="+dir, "GONNER_HEALTH_PORT=0")
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "loading health TLS certificate") {
+		t.Fatalf("exit=%v output=%s", err, output)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("workload ran after TLS startup failure")
+	}
 }

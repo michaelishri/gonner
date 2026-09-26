@@ -1,6 +1,7 @@
 package condition
 
 import (
+	"context"
 	"os"
 	"strings"
 )
@@ -24,7 +25,10 @@ func (c *EnvCondition) Type() string {
 }
 
 // Evaluate checks the environment variable.
-func (c *EnvCondition) Evaluate() (bool, error) {
+func (c *EnvCondition) Evaluate(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if idx := strings.Index(c.raw, "="); idx > 0 {
 		key := c.raw[:idx]
 		expected := c.raw[idx+1:]

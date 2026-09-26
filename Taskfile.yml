@@ -22,7 +22,7 @@ tasks:
   test:
     desc: Run tests with race detection and coverage
     cmds:
-      - go test ./... -v -race -cover
+      - go test ./... -v -race -count=1 -cover
 
   lint:
     desc: Run golangci-lint
