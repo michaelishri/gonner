@@ -243,10 +243,7 @@ func SignalGroup(pid int, sig syscall.Signal) error {
 	if pid <= 0 {
 		return nil
 	}
-	err := syscall.Kill(-pid, sig)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
-	}
+	_, err := groupSignalResult(pid, syscall.Kill(-pid, sig))
 	return err
 }
 

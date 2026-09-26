@@ -105,11 +105,8 @@ func (s *Service) StartReaper(ctx context.Context) (func(), error) {
 // Linux zombies must not consume the entire grace period: they cannot receive
 // signals or hold pipes. PID 1's reaper will collect them independently.
 func groupAlive(pgid int) (bool, error) {
-	err := syscall.Kill(-pgid, 0)
-	if errors.Is(err, syscall.ESRCH) {
-		return false, nil
-	}
-	if err != nil {
+	exited, err := groupSignalResult(pgid, syscall.Kill(-pgid, 0))
+	if exited || err != nil {
 		return false, err
 	}
 	paths, err := filepath.Glob("/proc/[0-9]*/stat")
@@ -138,4 +135,12 @@ func groupAlive(pgid int) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// groupSignalResult distinguishes an exited group from a signal failure.
+func groupSignalResult(_ int, err error) (exited bool, signalErr error) {
+	if errors.Is(err, syscall.ESRCH) {
+		return true, nil
+	}
+	return false, err
 }

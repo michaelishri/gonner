@@ -15,6 +15,7 @@ All notable changes to this project are documented in this file. The format foll
 ### Fixed
 
 - Give every managed child exactly one wait owner; coordinate Linux PID 1 orphan reaping with the shared execution service used by main commands, precommands, and command conditions.
+- Treat macOS groups containing only exited processes as stopped while preserving signal permission errors for live processes.
 - Preserve oversized and unterminated output, drain pipes after child exit, share log sinks across instances, prevent backup collisions, and keep console output flowing after file errors.
 - Propagate unavailable dependencies without hangs and allow any successfully started instance to satisfy the initial dependency gate.
 - Report permanent failures with exit 1, cancel all work for critical failures including required precommands, and allow unrelated work to continue after noncritical failures.
