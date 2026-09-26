@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"context"
 	"errors"
 	"os/exec"
 	"syscall"
@@ -65,5 +66,21 @@ func TestDarwinLiveGroupPreservesSignalErrors(t *testing.T) {
 	}
 	if err := SignalGroup(pid, syscall.Signal(-1)); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("suppressed invalid signal: %v", err)
+	}
+}
+
+func TestDarwinCancellationDuringExit(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		r := NewService().Run(ctx, Spec{
+			Command:     "exec sleep 30",
+			StopSignal:  syscall.SIGKILL,
+			StopTimeout: time.Second,
+			OnStart:     func(int) { cancel() },
+		})
+		cancel()
+		if r.Err != context.Canceled {
+			t.Fatalf("cancellation %d: %v", i, r.Err)
+		}
 	}
 }
