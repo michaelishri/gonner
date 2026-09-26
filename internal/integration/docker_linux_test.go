@@ -43,7 +43,7 @@ func TestDockerPID1AndPrivilegeBoundaries(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, mode := range []string{"stress", "credentials", "missing-kill", "files", "conditions"} {
+	for _, mode := range []string{"stress", "credentials", "missing-kill", "files", "conditions", "control"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			defer cancel()
@@ -85,6 +85,8 @@ func TestContainerHelper(t *testing.T) {
 		testUnsafeFiles(t)
 	case "conditions":
 		testConditionGroups(t)
+	case "control":
+		testControlledGroups(t)
 	default:
 		t.Fatalf("unknown mode %q", mode)
 	}
@@ -296,5 +298,74 @@ func noChildren(t *testing.T) {
 			t.Fatalf("unreaped or live descendants: %v", live)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func testControlledGroups(t *testing.T) {
+	cfg := &config.Config{
+		Control:         &config.ControlConfig{Socket: "/tmp/unused-control.sock", RestartGrace: config.Duration(50 * time.Millisecond)},
+		ShutdownTimeout: config.Duration(50 * time.Millisecond),
+		Run: []config.ProcessConfig{{Name: "worker", Instances: 2,
+			Command:     "trap '' TERM; sleep 60 & touch /tmp/ready-$GONNER_GENERATION; wait",
+			AutoRestart: true, RestartOnSuccess: true, Controllable: true,
+			Backoff: &config.BackoffConfig{InitialDelay: config.Duration(200 * time.Millisecond), MaxDelay: config.Duration(200 * time.Millisecond), Multiplier: 1},
+		}},
+	}
+	mgr := runner.NewManager(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	done := make(chan error, 1)
+	go func() { done <- mgr.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("controlled processes did not join")
+		}
+		noChildren(t)
+	}()
+	await := func(check func([]runner.InstanceInfo) bool) []runner.InstanceInfo {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			instances := mgr.Instances()
+			if check(instances) {
+				return instances
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatal("control state did not settle")
+		return nil
+	}
+	first := await(func(states []runner.InstanceInfo) bool {
+		for _, s := range states {
+			if s.State != runner.StateRunning {
+				return false
+			}
+			if _, err := os.Stat("/tmp/ready-" + s.Generation); err != nil {
+				return false
+			}
+		}
+		return len(states) == 2
+	})
+	old := first[0]
+	started := time.Now()
+	if err := mgr.Restart(old.ID, old.Generation, 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	next := await(func(states []runner.InstanceInfo) bool {
+		return states[0].Generation != old.Generation && states[0].State == runner.StateRunning
+	})
+	if time.Since(started) > time.Second || !next[0].PreviousReaped || next[0].PreviousGeneration != old.Generation {
+		t.Fatalf("replacement lacks bounded reap evidence: %+v", next)
+	}
+	if next[1].Generation != first[1].Generation {
+		t.Fatal("sibling was restarted")
+	}
+	if err := mgr.Restart(old.ID, old.Generation, time.Millisecond); err == nil {
+		t.Fatal("stale generation accepted")
 	}
 }

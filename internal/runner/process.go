@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -59,6 +61,11 @@ type Process struct {
 	readyCh, doneCh         chan struct{}
 	readyOnce, doneOnce     sync.Once
 	onCriticalExit          func()
+	generation              string
+	previousGeneration      string
+	previousReaped          bool
+	restartRequested        bool
+	generationStop          chan<- time.Duration
 }
 
 func NewProcess(cfg config.ProcessConfig, id int, timeout time.Duration, onCriticalExit func()) *Process {
@@ -159,10 +166,22 @@ func (p *Process) Run(parent context.Context) error {
 			return nil
 		}
 		p.state.Store(StateStarting)
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return p.fail(err)
+		}
+		generation := hex.EncodeToString(nonce[:])
+		stopRequest := make(chan time.Duration, 1)
 		spec := p.spec(p.cfg.Command, p.cfg.WorkDir)
+		spec.Env = append(spec.Env, "GONNER_INSTANCE_ID="+p.Name(), "GONNER_GENERATION="+generation)
+		spec.StopRequest = stopRequest
+		spec.ConfirmReaped = p.cfg.Controllable
 		spec.OnStart = func(pid int) {
 			p.mu.Lock()
 			p.pid = pid
+			p.generation = generation
+			p.generationStop = stopRequest
+			p.restartRequested = false
 			p.startedAt = time.Now()
 			if p.launches > 0 {
 				p.restarts++
@@ -175,12 +194,20 @@ func (p *Process) Run(parent context.Context) error {
 		spec.OnExit = func(runtime time.Duration) {
 			p.mu.Lock()
 			p.pid = 0
-			p.state.Store(StateStarting)
+			p.state.Store(StateStopping)
 			p.mu.Unlock()
 			p.backoff.RecordExit(runtime)
 		}
 		spec.OnStop = p.markStopping
 		result := p.service.Run(ctx, spec)
+		p.mu.Lock()
+		if result.Started {
+			p.previousGeneration = generation
+			p.previousReaped = result.Reaped
+		}
+		p.generationStop = nil
+		p.state.Store(StateStopped)
+		p.mu.Unlock()
 		var supervisor *execution.SupervisorError
 		if errors.As(result.Err, &supervisor) {
 			return p.fail(result.Err)
@@ -189,7 +216,7 @@ func (p *Process) Run(parent context.Context) error {
 			p.state.Store(StateStopped)
 			return nil
 		}
-		if result.Err == nil && result.ExitCode == 0 {
+		if result.Err == nil && result.ExitCode == 0 && !p.cfg.RestartOnSuccess && !p.requestedRestart() {
 			p.state.Store(StateStopped)
 			return nil
 		}
@@ -261,12 +288,18 @@ func (p *Process) ForwardSignal(sig os.Signal) error {
 	return execution.SignalGroup(p.pid, s)
 }
 func (p *Process) buildEnv() []string {
-	if len(p.cfg.Env) == 0 {
-		return nil
+	env := []string{}
+	if !p.cfg.ClearEnv {
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, "GONNER_INSTANCE_ID=") && !strings.HasPrefix(entry, "GONNER_GENERATION=") {
+				env = append(env, entry)
+			}
+		}
 	}
-	env := os.Environ()
 	for k, v := range p.cfg.Env {
-		env = append(env, k+"="+v)
+		if k != "GONNER_INSTANCE_ID" && k != "GONNER_GENERATION" {
+			env = append(env, k+"="+v)
+		}
 	}
 	return env
 }

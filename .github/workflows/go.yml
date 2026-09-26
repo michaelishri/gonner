@@ -20,6 +20,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Verify source and modules
+        run: |
+          go mod download all
+          go mod verify
+          git diff --exit-code -- go.mod go.sum
+          test -z "$(gofmt -l $(git ls-files '*.go'))"
+          go build ./...
       - run: go vet ./...
       - run: go test -race -count=1 -cover ./...
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'

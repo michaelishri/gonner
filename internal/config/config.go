@@ -16,12 +16,21 @@ type Config struct {
 	// Health configures the optional HTTP health endpoint.
 	Health *HealthConfig `json:"health,omitempty" yaml:"health,omitempty"`
 
+	// Control enables a private, same-UID Unix management endpoint. No TCP control API.
+	Control *ControlConfig `json:"control,omitempty" yaml:"control,omitempty"`
+
 	// Run is the list of process definitions to manage.
 	Run []ProcessConfig `json:"run" yaml:"run"`
 
 	// PIDFile is a path where gonner writes its own PID on startup.
 	// Useful for sysadmins / process supervisors.
 	PIDFile string `json:"pidFile,omitempty" yaml:"pidFile,omitempty"`
+}
+
+// ControlConfig defines the opt-in management protocol v1.
+type ControlConfig struct {
+	Socket       string   `json:"socket" yaml:"socket"`
+	RestartGrace Duration `json:"restartGrace,omitempty" yaml:"restartGrace,omitempty"`
 }
 
 // HealthConfig defines HTTP health endpoint settings.
@@ -100,6 +109,12 @@ type ProcessConfig struct {
 	// AutoRestart enables automatic restart on process exit.
 	AutoRestart bool `json:"autoRestart,omitempty" yaml:"autoRestart,omitempty"`
 
+	// RestartOnSuccess also restarts intentional clean exits. Requires AutoRestart.
+	RestartOnSuccess bool `json:"restartOnSuccess,omitempty" yaml:"restartOnSuccess,omitempty"`
+
+	// Controllable permits conditional restart via the private management socket.
+	Controllable bool `json:"controllable,omitempty" yaml:"controllable,omitempty"`
+
 	// MaxRetries limits restart attempts (0 = unlimited when AutoRestart is true).
 	MaxRetries int `json:"maxRetries,omitempty" yaml:"maxRetries,omitempty"`
 
@@ -125,6 +140,9 @@ type ProcessConfig struct {
 	// WhenAny requires at least one condition to be true for the process to start.
 	// Each element is a single condition as a {type: value} object.
 	WhenAny []map[string]string `json:"whenAny,omitempty" yaml:"whenAny,omitempty"`
+
+	// ClearEnv starts the child with no inherited environment before Env/bootstrap overlays.
+	ClearEnv bool `json:"clearEnv,omitempty" yaml:"clearEnv,omitempty"`
 
 	// Env is a map of environment variables to set for this process.
 	Env map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
@@ -184,6 +202,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Health != nil && c.Health.BindAddr == "" {
 		c.Health.BindAddr = "0.0.0.0"
+	}
+	if c.Control != nil && c.Control.RestartGrace == 0 {
+		c.Control.RestartGrace = Duration(100 * time.Millisecond)
 	}
 	for i := range c.Run {
 		if c.Run[i].Instances <= 0 {

@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/michaelishri/gonner/internal/config"
+	"github.com/michaelishri/gonner/internal/control"
 	"github.com/michaelishri/gonner/internal/health"
 	"github.com/michaelishri/gonner/internal/logging"
 	"github.com/michaelishri/gonner/internal/runner"
@@ -70,6 +71,14 @@ func runRun(_ *cobra.Command, _ []string) error {
 	sigHandler := runner.NewSignalHandler(cancel, mgr.ForwardSignal)
 	go sigHandler.Start()
 	defer sigHandler.Stop()
+
+	if cfg.Control != nil {
+		stop, err := control.Start(ctx, *cfg.Control, mgr)
+		if err != nil {
+			return fmt.Errorf("failed to start private control endpoint: %w", err)
+		}
+		defer stop()
+	}
 
 	var healthErr error
 	var healthDone chan struct{}

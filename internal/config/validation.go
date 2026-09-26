@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -66,6 +68,15 @@ func ValidateWithWarnings(cfg *Config) (*ValidationResult, error) {
 		}
 	}
 
+	if cfg.Control != nil {
+		if !filepath.IsAbs(cfg.Control.Socket) || filepath.Clean(cfg.Control.Socket) != cfg.Control.Socket || len(cfg.Control.Socket) > 100 {
+			errs = append(errs, "control.socket must be a canonical absolute Unix socket path of at most 100 bytes")
+		}
+		if d := time.Duration(cfg.Control.RestartGrace); d < time.Millisecond || d > 30*time.Second {
+			errs = append(errs, "control.restartGrace must be between 1ms and 30s")
+		}
+	}
+
 	// Must have at least one process
 	if len(cfg.Run) == 0 {
 		errs = append(errs, "at least one process must be defined in \"run\"")
@@ -82,6 +93,15 @@ func ValidateWithWarnings(cfg *Config) (*ValidationResult, error) {
 			continue
 		}
 
+		if cfg.Control != nil && !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`).MatchString(proc.Name) {
+			errs = append(errs, prefix+": control requires simple process names")
+		}
+		if proc.RestartOnSuccess && !proc.AutoRestart {
+			errs = append(errs, prefix+": restartOnSuccess requires autoRestart")
+		}
+		if proc.Controllable && (cfg.Control == nil || !proc.AutoRestart || proc.Critical) {
+			errs = append(errs, prefix+": controllable requires control, autoRestart and critical=false")
+		}
 		// Unique name
 		if names[proc.Name] {
 			errs = append(errs, fmt.Sprintf("%s: duplicate process name", prefix))

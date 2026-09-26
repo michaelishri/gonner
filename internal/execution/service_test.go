@@ -1,6 +1,7 @@
 package execution
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"io"
@@ -82,5 +83,34 @@ func TestLaterCancellationPreservesObservedExitFailure(t *testing.T) {
 	r := NewService().Run(ctx, Spec{Command: "exit 19", OnExit: func(time.Duration) { cancel() }})
 	if r.Cancelled || r.ExitCode != 19 || r.Err == nil || r.Err == context.Canceled {
 		t.Fatalf("lost pre-cancellation failure: %+v", r)
+	}
+}
+
+func TestTargetedStopUsesOwnGraceAndConfirmsReaping(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stopRequest := make(chan time.Duration, 1)
+	started := time.Now()
+	r := NewService().Run(ctx, Spec{
+		Command:     "trap '' TERM; printf 'ready\\n'; exec sleep 60",
+		StopTimeout: 2 * time.Second, StopRequest: stopRequest, ConfirmReaped: true,
+		Output: func(reader io.Reader) error {
+			buffer := bufio.NewReader(reader)
+			line, err := buffer.ReadString('\n')
+			if line == "ready\n" {
+				stopRequest <- 20 * time.Millisecond
+			}
+			if err != nil && err != io.EOF {
+				return err
+			}
+			_, err = io.Copy(io.Discard, buffer)
+			return err
+		},
+	})
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("targeted stop used global grace: %s", elapsed)
+	}
+	if ctx.Err() != nil || r.Cancelled || !r.Reaped {
+		t.Fatalf("targeted stop affected parent or failed cleanup: %+v, %v", r, ctx.Err())
 	}
 }
