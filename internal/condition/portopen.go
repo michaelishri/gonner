@@ -1,7 +1,9 @@
 package condition
 
 import (
+	"context"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,6 +26,9 @@ func NewPortOpenCondition(value string) Condition {
 			target = value[:idx]
 		}
 	}
+	if _, err := strconv.ParseUint(target, 10, 16); err == nil {
+		target = net.JoinHostPort("127.0.0.1", target)
+	}
 	if strings.HasPrefix(target, ":") {
 		target = "127.0.0.1" + target
 	}
@@ -35,11 +40,16 @@ func (c *PortOpenCondition) Type() string { return "portOpen" }
 
 // Evaluate attempts a TCP dial within the configured timeout.
 // Connection refused and timeouts both yield (false, nil) rather than an error.
-func (c *PortOpenCondition) Evaluate() (bool, error) {
-	conn, err := net.DialTimeout("tcp", c.target, c.timeout)
+func (c *PortOpenCondition) Evaluate(ctx context.Context) (bool, error) {
+	conn, err := (&net.Dialer{Timeout: c.timeout}).DialContext(ctx, "tcp", c.target)
+	if conn != nil {
+		defer conn.Close()
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	if err != nil {
 		return false, nil
 	}
-	_ = conn.Close()
 	return true, nil
 }

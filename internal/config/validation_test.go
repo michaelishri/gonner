@@ -324,3 +324,15 @@ func TestValidate_ValidEnv(t *testing.T) {
 		t.Errorf("expected no error, got: %v", err)
 	}
 }
+
+func TestSequentialRejectsForwardDependencies(t *testing.T) {
+	cfg := &Config{Mode: "sequential", Run: []ProcessConfig{{Name: "first", Command: "true", DependsOn: []string{"later"}}, {Name: "later", Command: "true"}}}
+	cfg.ApplyDefaults()
+	if err := Validate(cfg); err == nil {
+		t.Fatal("accepted forward dependency")
+	}
+	cfg.Mode = "parallel"
+	if err := Validate(cfg); err != nil {
+		t.Fatal(err)
+	}
+}

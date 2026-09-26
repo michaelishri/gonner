@@ -1,7 +1,9 @@
 // Package config defines the configuration structures and parsing for gonner.
 package config
 
-import "time"
+import (
+	"time"
+)
 
 // Config is the top-level gonner configuration.
 type Config struct {
@@ -81,7 +83,8 @@ type ProcessConfig struct {
 	LogRotate *LogRotateConfig `json:"logRotate,omitempty" yaml:"logRotate,omitempty"`
 
 	// User drops privileges to this username (or numeric UID) before exec.
-	// Requires gonner to start as root. Linux/macOS only.
+	// Uses the account primary GID; unknown numeric UIDs require Group.
+	// Requires appropriate Linux capabilities or root on macOS.
 	User string `json:"user,omitempty" yaml:"user,omitempty"`
 
 	// Group sets the primary group (name or numeric GID) for the process. Requires User.
@@ -109,7 +112,8 @@ type ProcessConfig struct {
 	// Critical marks this process as critical — its unexpected exit triggers full shutdown.
 	Critical bool `json:"critical,omitempty" yaml:"critical,omitempty"`
 
-	// DependsOn lists process names that must be running before this one starts.
+	// DependsOn lists process names for which any instance must have started
+	// successfully at least once before this one starts.
 	DependsOn []string `json:"dependsOn,omitempty" yaml:"dependsOn,omitempty"`
 
 	// WhenAll requires all conditions to be true for the process to start.

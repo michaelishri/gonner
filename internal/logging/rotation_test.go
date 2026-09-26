@@ -9,7 +9,7 @@ import (
 )
 
 func TestWriter_FilePermissions(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	logPath := filepath.Join(dir, "secure.log")
 
 	w, err := NewWriterWithOptions(Options{ProcessName: "p", LogFilePath: logPath})
@@ -31,19 +31,14 @@ func TestWriter_FilePermissions(t *testing.T) {
 }
 
 func TestWriter_Rotation(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	logPath := filepath.Join(dir, "rotate.log")
 
-	w := &Writer{
-		processName: "p",
-		stdout:      io.Discard,
-		logFilePath: logPath,
-		logFileMode: 0o600,
-		rotate:      &RotateOptions{MaxSizeMB: 1, MaxBackups: 2},
+	w, err := NewWriterWithOptions(Options{ProcessName: "p", LogFilePath: logPath, Rotate: &RotateOptions{MaxSizeMB: 1, MaxBackups: 2}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := w.openLogFile(); err != nil {
-		t.Fatalf("new: %v", err)
-	}
+	w.stdout = io.Discard
 	defer w.Close()
 
 	// Write > 1 MB to trigger rotation.

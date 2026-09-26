@@ -54,8 +54,8 @@ type statusAPIResponse struct {
 	} `json:"processes"`
 }
 
-func runStatus(_ *cobra.Command, _ []string) error {
-	port := resolveStatusPort()
+func runStatus(cmd *cobra.Command, _ []string) error {
+	port := resolveStatusPort(cmd.Flags().Changed("port"))
 	scheme := "http"
 	if statusTLS {
 		scheme = "https"
@@ -119,13 +119,14 @@ func runStatus(_ *cobra.Command, _ []string) error {
 
 // resolveStatusPort determines the status endpoint port.
 // CLI flag takes priority, then GONNER_HEALTH_PORT env var, then default.
-func resolveStatusPort() int {
+func resolveStatusPort(explicit bool) int {
+	if explicit {
+		return statusPort
+	}
 	if envPort := os.Getenv("GONNER_HEALTH_PORT"); envPort != "" {
 		var port int
 		if _, err := fmt.Sscanf(envPort, "%d", &port); err == nil && port > 0 {
-			if statusPort == health.DefaultHealthPort {
-				return port
-			}
+			return port
 		}
 	}
 	return statusPort

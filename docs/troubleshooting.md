@@ -105,7 +105,7 @@ The health server has built-in timeouts (`ReadHeaderTimeout=5s`, `Read/Write=15s
 
 ### Process output not appearing on stdout
 
-- Per-line scanning is used. If your child writes binary or extremely long lines (> 1 MiB), the scanner drops to the next newline. Increase your line-flush frequency in the child if possible.
+- Oversized output streams in 64 KiB chunks. Console chunks each get a prefix; raw log files retain every byte, including a missing final newline. Check gonner stderr for file errors or shutdown drain truncation.
 - `gonner.json` parse errors go to stderr, not stdout.
 
 ### Log file is empty

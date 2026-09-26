@@ -34,7 +34,7 @@ func TestWriter_StdoutPrefix(t *testing.T) {
 }
 
 func TestWriter_LogFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	logPath := filepath.Join(dir, "test.log")
 
 	w, err := NewWriter("proc", logPath)
@@ -68,13 +68,13 @@ func TestWriter_NoLogFile(t *testing.T) {
 	}
 	defer w.Close()
 
-	if w.logFile != nil {
+	if w.sink != nil {
 		t.Error("logFile should be nil when no path is given")
 	}
 }
 
 func TestWriter_LogFileCreatesDirectory(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	logPath := filepath.Join(dir, "sub", "dir", "test.log")
 
 	w, err := NewWriter("proc", logPath)

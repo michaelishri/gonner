@@ -132,12 +132,28 @@ Gonner's own operational events (startup, condition results, restarts, shutdown)
 
 ### Log lifecycle
 
-- The line scanner buffers up to 1 MiB per line.
-- Each `Write` is atomic per Writer (mutex-protected).
-- Rotation closes and renames the file, optionally gzips it, prunes excess backups, then reopens.
+- Output is streamed in chunks of at most 64 KiB. Oversized lines continue draining; every console chunk gets a prefix and newline. Raw files preserve every byte, including an absent final newline.
+- Writers sharing a canonical path use one file descriptor, mutex and rotation counter.
+- Rotation exclusively reserves a unique backup name and keeps the old descriptor usable if replacement fails. Compression uses a temporary file and publishes only after successful completion.
+- Pruning ignores legacy backups, unrelated prefixes, special files and active configured log paths.
+- A file error does not suppress console output or stop draining. Writes retry on subsequent chunks; diagnostics report the first error, then at most once per minute until recovery.
+- Readers drain to EOF after a child exits. During shutdown, an escaped descendant retaining a pipe can cause forced closure at the shutdown deadline, with an explicit truncation diagnostic.
 
 ### Shipping logs
 
 For Docker, the docker logging driver receives both gonner's stdout and stderr — no extra wiring is needed for `docker logs`. For Kubernetes, the kubelet captures the same streams.
 
-If you want to forward logs from the configured `logFile`, mount it onto a sidecar (Fluent Bit, Vector) and have that read & rotate independently. In that case set `logRotate: null` on gonner.
+If you want to forward logs from the configured `logFile`, mount it onto a sidecar (Fluent Bit, Vector) and have that read the files without replacing gonner's active path. Keep rotation under gonner's ownership; use console collection if the collector needs to control rotation.
+
+## Upgrade from the audited baseline
+
+See [the audit resolution matrix](audits/2026-09-25-codebase-audit.md#resolution-matrix-2026-09-26) for regression coverage. Existing configuration keys, HTTP fields and lifecycle state names are unchanged. Review these behavior changes before upgrading:
+
+- Build with Go 1.26.7 or newer. CI scans source and all four static release artifacts with govulncheck v1.8.0 before publication.
+- Keep log and PID paths owned by root or the supervisor UID, outside workload-controlled directories. Group/other writable paths are rejected except protected sticky ancestors. Log leaves must be single-link regular files; symlinks and devices are rejected. Use mode 0600 or 0640.
+- Give unknown numeric users an explicit group. Known numeric users now use their real primary GID. Supplementary groups are cleared. Linux cross-UID supervision needs `SETUID`, `SETGID` and `KILL`; startup checks these before any command condition.
+- Permanent noncritical failures keep unrelated work running but now produce eventual exit 1. Critical precommand failures stop everything unless `continueOnError` is set.
+- A skipped critical process stays unready. Readiness includes configured critical processes from construction, and skipped processes remain in status and metrics.
+- Sequential forward dependencies are rejected. Dependencies are satisfied by any successful initial start, including one-shot commands.
+- Oversized console lines are split into prefixed 64 KiB chunks. Raw log files remain byte-exact. Legacy rotated files are retained and require separate retention management.
+- Custom conditions must implement `Evaluate(context.Context) (bool, error)`; evaluation helpers take context first. Command probes run with their configured process credentials, environment and working directory and cannot outlive cancellation in the original process group.

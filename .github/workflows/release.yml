@@ -15,7 +15,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  verify:
+    if: github.event.pull_request.merged == true
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race -count=1 -cover ./...
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: PID 1 and capability integration tests
+        if: runner.os == 'Linux'
+        run: |
+          docker pull alpine:3.21
+          GONNER_DOCKER_TESTS=1 go test -count=1 -timeout=10m ./internal/integration
   release:
+    needs: verify
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
@@ -40,17 +64,9 @@ jobs:
       - name: Determine release bump
         id: bump
         shell: bash
-        run: |
-          labels='${{ toJson(github.event.pull_request.labels.*.name) }}'
-          bump=patch
-
-          if echo "$labels" | grep -q '"release:major"'; then
-            bump=major
-          elif echo "$labels" | grep -q '"release:minor"'; then
-            bump=minor
-          fi
-
-          echo "level=$bump" >> "$GITHUB_OUTPUT"
+        env:
+          PR_LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: python3 scripts/release_bump.py >> "$GITHUB_OUTPUT"
 
       - name: Compute next tag
         id: version
@@ -91,16 +107,17 @@ jobs:
       - name: Create local release tag
         run: git tag "${{ steps.version.outputs.tag }}" "${{ github.event.pull_request.merge_commit_sha }}"
 
-      - name: Run tests
-        run: |
-          export PATH="$(go env GOPATH)/bin:$PATH"
-          task test
-
       - name: Build release artifacts
         run: |
           export PATH="$(go env GOPATH)/bin:$PATH"
           task release
           (cd bin && shasum -a 256 gonner-* > checksums.txt)
+
+      - name: Check vulnerabilities before publishing
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./...
+          bash scripts/check-artifacts.sh bin
 
       - name: Push release tag
         run: git push origin "${{ steps.version.outputs.tag }}"
